@@ -10,11 +10,8 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
-from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
-
-logger = init_logger(__name__)
 
 SeqId = int
 EncoderSeqId = str
@@ -148,34 +145,27 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         else:
             return AllocStatus.LATER
 
-    def _allocate_sequence(
-        self, seq: Sequence
-    ) -> Tuple[BlockTable, Tuple[List[int], List[int]]]:
+    def _allocate_sequence(self, seq: Sequence) -> BlockTable:
         block_table = BlockTable(
             block_size=self.block_size,
             block_allocator=self.block_allocator,
             max_block_sliding_window=self.max_block_sliding_window,
         )
-        to_swap = block_table.allocate(seq.get_token_ids())
+        block_table.allocate(seq.get_token_ids())
 
-        return block_table, to_swap
+        return block_table
 
-    def allocate(
-        self, seq_group: SequenceGroup
-    ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    def allocate(self, seq_group: SequenceGroup) -> None:
 
         # Allocate self-attention block tables for decoder sequences
         waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
-        assert not (
-            set(seq.seq_id for seq in waiting_seqs) & self.block_tables.keys()
-        ), "block table already exists"
+        assert not (set(seq.seq_id for seq in waiting_seqs)
+                    & self.block_tables.keys()), "block table already exists"
 
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
         seq = waiting_seqs[0]
-        block_table, (blocks_to_swap_in, blocks_to_swap_out) = self._allocate_sequence(
-            seq
-        )
+        block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
 
         # Track seq
@@ -196,22 +186,17 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         # encoder prompt.
         request_id = seq_group.request_id
 
-        assert request_id not in self.cross_block_tables, "block table already exists"
+        assert (request_id
+                not in self.cross_block_tables), \
+                "block table already exists"
 
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
         if seq_group.is_encoder_decoder():
             encoder_seq = seq_group.get_encoder_seq()
             assert encoder_seq is not None
-            block_table, to_swap = self._allocate_sequence(encoder_seq)
-            blocks_to_swap_in.extend(to_swap[0])
-            blocks_to_swap_out.extend(to_swap[1])
+            block_table = self._allocate_sequence(encoder_seq)
             self.cross_block_tables[request_id] = block_table
-        
-        # Swap blocks in
-        swap_in_mapping = self.swap_in()
-
-        return blocks_to_swap_in, blocks_to_swap_out
 
     def can_append_slots(self, seq_group: SequenceGroup,
                          num_lookahead_slots: int) -> bool:
@@ -517,7 +502,3 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             return AllocStatus.OK
         else:
             return AllocStatus.LATER
-
-    def print_content(self):
-        # TODO(noppanat): Remove this.
-        self.block_allocator.print_content(logger)  # type: ignore
