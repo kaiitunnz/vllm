@@ -1145,8 +1145,9 @@ class Scheduler:
         logger.info("[noppanat]: seq_groups_to_allocate %s",
                     seq_groups_to_allocate)
 
-        for seq_group, seq_metas, seq_group_meta in zip(seq_groups_to_allocate,
-                                        seq_metas_to_allocate, seq_group_meta_list):
+        for seq_group, seq_metas, seq_group_meta in zip(
+                seq_groups_to_allocate, seq_metas_to_allocate,
+                seq_group_meta_list):
             num_lookahead_slots, num_new_tokens, num_new_seqs = seq_group_meta
             # Can schedule this request.
             if curr_loras is not None and seq_group.lora_int_id > 0:
@@ -1608,8 +1609,7 @@ class Scheduler:
                          "num_computed_tokens: %s, "
                          "num_uncomputed_tokens: %s"),
                         seq.data.get_prompt_token_ids(),
-                        seq.data.get_token_ids(),
-                        seq.data.get_len(),
+                        seq.data.get_token_ids(), seq.data.get_len(),
                         seq.data.get_num_computed_tokens(),
                         seq.data.get_num_uncomputed_tokens())
 

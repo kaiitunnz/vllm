@@ -73,6 +73,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             block IDs. If not provided, block IDs will be assigned sequentially
             from 0 to num_blocks - 1.
     """
+
     def __repr__(self) -> str:
         ret = []
         for block_id, tracker in self._block_tracker.items():
@@ -80,7 +81,6 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
                         "computed" if tracker.computed
                         or block_id in self.evictor else "not computed"))
         return repr(ret)
-
 
     def __init__(
         self,
