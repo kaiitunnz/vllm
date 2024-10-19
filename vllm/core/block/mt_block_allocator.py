@@ -486,9 +486,8 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
     def print_content(self, logger: Logger):
         # TODO(noppanat): Remove this.
         for device, allocator in self._allocators.items():
-            assert hasattr(allocator, "_prefix_cache")
-            logger.info("Device: %s, Cached blocks: %s", device,
-                        allocator._prefix_cache)  # type: ignore
+            logger.info("[noppanat] Device: %s, Cached blocks: %s", device,
+                        allocator)  # type: ignore
 
 
 class NullBlock(Block):

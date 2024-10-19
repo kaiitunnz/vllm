@@ -32,8 +32,6 @@ class PrefixCache:
         return PrefixCache(self._prefix_cache, block_ids)
 
     def get(self, content_hash: PrefixHash) -> Optional[Block]:
-        logger.info("[noppanat] get content_hash=%s, self=%s", content_hash,
-                    self)
         block = self._prefix_cache.get(content_hash, None)
         if ((block is None) or (self._block_ids is None)
                 # or (block.block_id is None)   # TODO(noppanat): Check this.
@@ -75,6 +73,14 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             block IDs. If not provided, block IDs will be assigned sequentially
             from 0 to num_blocks - 1.
     """
+    def __repr__(self) -> str:
+        ret = []
+        for block_id, tracker in self._block_tracker.items():
+            ret.append(("active" if tracker.active else "inactive",
+                        "computed" if tracker.computed
+                        or block_id in self.evictor else "not computed"))
+        return repr(ret)
+
 
     def __init__(
         self,
@@ -768,24 +774,16 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         assert ((block.state == BlockState.FREED)
                 or (block.state == BlockState.EVICTED))
         assert block.content_hash is not None
+        assert block.content_hash in self._prefix_cache
 
         block_id = block.block_id
         assert block_id is not None
-
-        logger.info(
-            "[noppanat] move_out block_id=%s, status=%s, refcount=%s",
-            block_id,
-            block.state,
-            self._refcounter.get(block_id),
-        )
 
         if block_id in self.evictor:
             # In case of moving out of lower-tier devices where all blocks are
             # in the evictor.
             self.evictor.remove(block_id)
             self._hashless_allocator.free_block_id(block_id)
-
-        assert block.content_hash in self._prefix_cache
 
         block.block_id = None
         block.set_state(BlockState.EVICTED)
@@ -799,10 +797,13 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         alloc = self.allocate_immutable_block(prev_block=block.prev_block,
                                               token_ids=block.token_ids)
         block = alloc.block
-
+        assert block.block_id is not None
         if evictable:
             self._decr_refcount_cached_block(block)
             assert block.state == BlockState.FREED
+        else:
+            # The block must have already been computed if moved in.
+            self._block_tracker[block.block_id].computed = True
 
         return alloc
 

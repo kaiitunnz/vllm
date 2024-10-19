@@ -344,7 +344,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         for device, allocator in self._allocators.items():
             if hasattr(allocator, "_cached_blocks"):
                 logger.info(
-                    "Device: %s, Cached blocks: %s",
+                    "[noppanat] Device: %s, Cached blocks: %s",
                     device,
                     allocator._cached_blocks,
                 )
