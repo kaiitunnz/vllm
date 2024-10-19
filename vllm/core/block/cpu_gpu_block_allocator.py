@@ -1,6 +1,8 @@
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from logging import Logger
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
-from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
+from vllm.core.block.interfaces import (AllocationOutput, Block,
+                                        BlockAllocator, BlockId,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
@@ -113,11 +115,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
     def allocate_or_get_null_block(self) -> Block:
         if self._null_block is None:
             self._null_block = NullBlock(
-                self.allocate_mutable_block(None, Device.GPU))
+                self.allocate_mutable_block(None, Device.GPU).block)
         return self._null_block
 
     def allocate_mutable_block(self, prev_block: Optional[Block],
-                               device: Device) -> Block:
+                               device: Device) -> AllocationOutput:
         """Allocates a new mutable block on the specified device.
 
         Args:
@@ -130,9 +132,10 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         """
         return self._allocators[device].allocate_mutable_block(prev_block)
 
-    def allocate_immutable_blocks(self, prev_block: Optional[Block],
-                                  block_token_ids: List[List[int]],
-                                  device: Device) -> List[Block]:
+    def allocate_immutable_blocks(
+            self, prev_block: Optional[Block],
+            block_token_ids: List[List[int]],
+            device: Device) -> Sequence[AllocationOutput]:
         """Allocates a new group of immutable blocks with the provided block 
         token IDs on the specified device.
 
@@ -152,7 +155,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
 
     def allocate_immutable_block(self, prev_block: Optional[Block],
                                  token_ids: List[int],
-                                 device: Device) -> Block:
+                                 device: Device) -> AllocationOutput:
         """Allocates a new immutable block with the provided token IDs on the
         specified device.
 
@@ -184,7 +187,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         allocator = self._block_ids_to_allocator[block_id]
         allocator.free(block)
 
-    def fork(self, last_block: Block) -> List[Block]:
+    def fork(self, last_block: Block) -> Sequence[AllocationOutput]:
         """Creates a new sequence of blocks that shares the same underlying
             memory as the original sequence.
 
@@ -242,7 +245,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             blocks: List of blocks to be swapped.
             src_device (Device): Device to swap the 'blocks' from.
             dst_device (Device): Device to swap the 'blocks' to.
-        
+ 
         Returns:
             Dict[int, int]: Swap mapping from source_device
                 on to dest_device.
@@ -336,6 +339,15 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         mapping = self._swap_mapping.copy()
         self._swap_mapping.clear()
         return list(mapping.items())
+
+    def print_content(self, logger: Logger):
+        for device, allocator in self._allocators.items():
+            if hasattr(allocator, "_cached_blocks"):
+                logger.info(
+                    "Device: %s, Cached blocks: %s",
+                    device,
+                    allocator._cached_blocks,
+                )
 
 
 class NullBlock(Block):

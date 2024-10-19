@@ -1,18 +1,34 @@
 from logging import Logger
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from vllm.core.block.interfaces import (
-    Block,
-    BlockAllocator,
-    BlockId,
-    DeviceAwareBlockAllocator,
-)
-from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
-from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
+from vllm.core.block.interfaces import Block, BlockId
+from vllm.core.block.mt_interfaces import (MTAllocationOutput,
+                                           MTBlockAllocator,
+                                           MTDeviceAwareBlockAllocator)
+from vllm.core.block.mt_prefix_caching_block import (
+    MTPrefixCachingBlockAllocator, PrefixCache)
 from vllm.utils import Device
 
 
-class MTBlockAllocator(DeviceAwareBlockAllocator):
+class BlockMover:
+    Entry = Tuple[Device, int]
+    Record = Dict[Entry, Entry]
+
+    def __init__(self):
+        self._record: BlockMover.Record = {}
+
+    def move(self, src: "BlockMover.Entry",
+             dst: Optional["BlockMover.Entry"]) -> None:
+        original_src = self._record.pop(src, None)
+        if dst is not None:
+            self._record[dst] = src if original_src is None else original_src
+
+    def get_and_reset_record(self) -> "BlockMover.Record":
+        record, self._record = self._record, {}
+        return record
+
+
+class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
     """A block allocator that can allocate blocks on both CPU and GPU memory.
 
     This class implements the `DeviceAwareBlockAllocator` interface and provides
@@ -30,7 +46,7 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         num_gpu_blocks: int,
         num_cpu_blocks: int,
         block_size: int,
-    ) -> DeviceAwareBlockAllocator:
+    ) -> MTDeviceAwareBlockAllocator:
         """Creates a MTBlockAllocator instance with the specified
         configuration.
 
@@ -61,68 +77,72 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         gpu_block_ids = block_ids[:num_gpu_blocks]
         cpu_block_ids = block_ids[num_gpu_blocks:]
 
-        if allocator_type == "naive":
-            gpu_allocator: BlockAllocator = NaiveBlockAllocator(
-                create_block=NaiveBlock,  # type: ignore
+        prefix_cache = PrefixCache()
+
+        if allocator_type == "prefix_caching":
+            gpu_allocator = MTPrefixCachingBlockAllocator(
                 num_blocks=num_gpu_blocks,
                 block_size=block_size,
                 block_ids=gpu_block_ids,
+                prefix_cache=prefix_cache,
             )
 
-            cpu_allocator: BlockAllocator = NaiveBlockAllocator(
-                create_block=NaiveBlock,  # type: ignore
+            cpu_allocator = MTPrefixCachingBlockAllocator(
                 num_blocks=num_cpu_blocks,
                 block_size=block_size,
                 block_ids=cpu_block_ids,
-            )
-        elif allocator_type == "prefix_caching":
-            gpu_allocator = PrefixCachingBlockAllocator(
-                num_blocks=num_gpu_blocks,
-                block_size=block_size,
-                block_ids=gpu_block_ids,
-            )
-
-            cpu_allocator = PrefixCachingBlockAllocator(
-                num_blocks=num_cpu_blocks,
-                block_size=block_size,
-                block_ids=cpu_block_ids,
+                prefix_cache=prefix_cache,
             )
         else:
             raise ValueError(f"Unknown allocator type {allocator_type=}")
 
-        return MTBlockAllocator(
+        return MTPrefixAwareBlockAllocator(
             cpu_block_allocator=cpu_allocator,
             gpu_block_allocator=gpu_allocator,
+            prefix_cache=prefix_cache,
         )
 
     def __init__(
-        self, cpu_block_allocator: BlockAllocator, gpu_block_allocator: BlockAllocator
+        self,
+        cpu_block_allocator: MTBlockAllocator,
+        gpu_block_allocator: MTBlockAllocator,
+        prefix_cache: PrefixCache,
     ):
         assert not (
-            cpu_block_allocator.all_block_ids & gpu_block_allocator.all_block_ids
+            cpu_block_allocator.all_block_ids
+            & gpu_block_allocator.all_block_ids
         ), "cpu and gpu block allocators can't have intersection of block ids"
 
+        self._device_tier = [Device.GPU, Device.CPU]  # Highest tier first.
         self._allocators = {
             Device.CPU: cpu_block_allocator,
             Device.GPU: gpu_block_allocator,
         }
+        self._prefix_cache = prefix_cache
 
         self._swap_mapping: Dict[int, int] = {}
+        self._block_mover = BlockMover()
         self._null_block: Optional[Block] = None
 
-        self._block_ids_to_allocator: Dict[int, BlockAllocator] = {}
-        for _, allocator in self._allocators.items():
+        self._block_ids_to_allocator: Dict[int, MTBlockAllocator] = {}
+        self._block_ids_to_device: Dict[int, Device] = {}
+        for device, allocator in self._allocators.items():
             for block_id in allocator.all_block_ids:
                 self._block_ids_to_allocator[block_id] = allocator
+                self._block_ids_to_device[block_id] = device
 
     def allocate_or_get_null_block(self) -> Block:
         if self._null_block is None:
-            self._null_block = NullBlock(self.allocate_mutable_block(None, Device.GPU))
+            self._null_block = NullBlock(
+                self.allocate_mutable_block(None, Device.GPU).block)
         return self._null_block
 
     def allocate_mutable_block(
-        self, prev_block: Optional[Block], device: Device
-    ) -> Block:
+        self,
+        prev_block: Optional[Block],
+        device: Device,
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> MTAllocationOutput:
         """Allocates a new mutable block on the specified device.
 
         Args:
@@ -131,16 +151,18 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
             device (Device): The device on which to allocate the new block.
 
         Returns:
-            Block: The newly allocated mutable block.
+            AllocationOutput: Output of successful allocation.
         """
-        return self._allocators[device].allocate_mutable_block(prev_block)
+        return self._allocators[device].allocate_mutable_block(
+            prev_block, block_ids_in_use=block_ids_in_use)
 
     def allocate_immutable_blocks(
         self,
         prev_block: Optional[Block],
         block_token_ids: List[List[int]],
         device: Device,
-    ) -> List[Block]:
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> List[MTAllocationOutput]:
         """Allocates a new group of immutable blocks with the provided block
         token IDs on the specified device.
 
@@ -152,16 +174,18 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
             device (Device): The device on which to allocate the new block.
 
         Returns:
-            List[Block]: The newly allocated list of immutable blocks
-                containing the provided block token IDs.
+            List[Block]: The newly allocated list of allocation outputs.
         """
-        return self._allocators[device].allocate_immutable_blocks(
-            prev_block, block_token_ids
-        )
+        return list(self._allocators[device].allocate_immutable_blocks(
+            prev_block, block_token_ids, block_ids_in_use=block_ids_in_use))
 
     def allocate_immutable_block(
-        self, prev_block: Optional[Block], token_ids: List[int], device: Device
-    ) -> Block:
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        device: Device,
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> MTAllocationOutput:
         """Allocates a new immutable block with the provided token IDs on the
         specified device.
 
@@ -176,7 +200,13 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
             Block: The newly allocated immutable block containing the provided
                 token IDs.
         """
-        return self._allocators[device].allocate_immutable_block(prev_block, token_ids)
+
+        return self._allocators[device].allocate_immutable_block(
+            prev_block, token_ids, block_ids_in_use=block_ids_in_use)
+
+    def allocate_cached_block(self, block: Block) -> MTAllocationOutput:
+        return self._allocators[self.get_device(block)].allocate_cached_block(
+            block)
 
     def free(self, block: Block) -> None:
         """Frees the memory occupied by the given block.
@@ -188,11 +218,16 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         if isinstance(block, NullBlock):
             return
         block_id = block.block_id
-        assert block_id is not None
+        assert block_id is not None, (
+            f"[noppanat] block.trace={block._trace}, "
+            f"block_id={block.block_id}, "
+            f"computed={block.computed}, "
+            f"content_hash={block.content_hash}, "
+            f"last_accessed={block.last_accessed}")
         allocator = self._block_ids_to_allocator[block_id]
         allocator.free(block)
 
-    def fork(self, last_block: Block) -> List[Block]:
+    def fork(self, last_block: Block) -> List[MTAllocationOutput]:
         """Creates a new sequence of blocks that shares the same underlying
             memory as the original sequence.
 
@@ -204,11 +239,12 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
                 original sequence.
         """
         # do not attempt to fork the null block
+        raise NotImplementedError("Forking is not supported.")
         assert not isinstance(last_block, NullBlock)
         block_id = last_block.block_id
         assert block_id is not None
         allocator = self._block_ids_to_allocator[block_id]
-        return allocator.fork(last_block)
+        return list(allocator.fork(last_block))
 
     def get_num_free_blocks(self, device: Device) -> int:
         """Returns the number of free blocks available on the specified device.
@@ -239,9 +275,94 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         """
         return self._allocators[device].get_physical_block_id(absolute_id)
 
-    def swap(
-        self, blocks: List[Block], src_device: Device, dst_device: Device
-    ) -> Dict[int, int]:
+    def _move(self,
+              block: Block,
+              src_device: Device,
+              dst_device: Optional[Device],
+              evictable: bool = False) -> Optional[Block]:
+        """
+        Returns:
+            Optional[Block]: The evicted block if any.
+        """
+        src_block_id = block.block_id
+        assert src_block_id is not None
+
+        if dst_device is None:
+            self._allocators[src_device].destroy(block)
+            self._block_mover.move((src_device, src_block_id), None)
+            return None
+
+        self._allocators[src_device].move_out(block)
+        alloc = self._allocators[dst_device].move_in(block,
+                                                     evictable=evictable)
+
+        dst_block_id = alloc.block.block_id
+        assert dst_block_id is not None, (
+            f"[noppanat] src_device={src_device}, "
+            f"src_block_id={src_block_id}, "
+            f"dst_device={dst_device}, "
+            f"dst_block_id={dst_block_id}, "
+            f"computed={block.computed}, "
+            f"content_hash={block.content_hash}, "
+            f"last_accessed={block.last_accessed}, "
+            f"trace={block._trace}")
+        src_block_id = self._allocators[src_device].get_physical_block_id(
+            src_block_id)
+        dst_block_id = self._allocators[dst_device].get_physical_block_id(
+            dst_block_id)
+        self._block_mover.move((src_device, src_block_id),
+                               (dst_device, dst_block_id))
+
+        return alloc.evicted_block
+
+    def move_in(self, blocks: List[Block]) -> None:
+        """Move in the given blocks to the top-tier device.
+
+        Args:
+            blocks: List of blocks to move in.
+        """
+        blocks_to_move_out: List[Block] = []
+        dst_device = self._device_tier[0]
+
+        for block in blocks:
+            assert block.content_hash is not None
+            assert block.content_hash in self._prefix_cache
+
+            src_device = self.get_device(block)
+            evicted_block = self._move(block, src_device, dst_device)
+
+            if evicted_block is not None:
+                blocks_to_move_out.append(evicted_block)
+
+        # Move out the evicted blocks down the device tier.
+        self.move_out(blocks_to_move_out)
+
+    def move_out(self, blocks: List[Block]) -> None:
+        """Move the given blocks down the device tier.
+        
+        Args:
+            blocks: List of blocks to move out.
+        """
+        for cur_device, next_device in zip(self._device_tier,
+                                           self._device_tier[1:]):
+            evicted_blocks: List[Block] = []
+            for block in blocks:
+                evicted_block = self._move(block,
+                                           cur_device,
+                                           next_device,
+                                           evictable=True)
+                if evicted_block is not None:
+                    evicted_blocks.append(evicted_block)
+            blocks = evicted_blocks
+
+        # Move out of the last device
+        last_device = self._device_tier[-1]
+        for block in blocks:
+            evicted_block = self._move(block, last_device, None)
+            assert evicted_block is None
+
+    def swap(self, blocks: List[Block], src_device: Device,
+             dst_device: Device) -> Dict[int, int]:
         """Execute the swap for the given blocks from source_device
         on to dest_device, save the current swap mapping and append
         them to the accumulated `self._swap_mapping` for each
@@ -256,19 +377,23 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
             Dict[int, int]: Swap mapping from source_device
                 on to dest_device.
         """
-        src_block_ids = [block.block_id for block in blocks]
-        self._allocators[src_device].swap_out(blocks)
-        self._allocators[dst_device].swap_in(blocks)
-        dst_block_ids = [block.block_id for block in blocks]
+        raise NotImplementedError("Swap is not yet supported.")
 
-        current_swap_mapping: Dict[int, int] = {}
-        for src_block_id, dst_block_id in zip(src_block_ids, dst_block_ids):
-            if src_block_id is not None and dst_block_id is not None:
-                self._swap_mapping[src_block_id] = dst_block_id
-                current_swap_mapping[src_block_id] = dst_block_id
-        return current_swap_mapping
+    def get_device(self, block: Block) -> Device:
+        assert block.block_id is not None
+        return self._block_ids_to_device[block.block_id]
 
-    def get_num_full_blocks_touched(self, blocks: List[Block], device: Device) -> int:
+    def get_device_from_id(self, block_id: int) -> Device:
+        return self._block_ids_to_device[block_id]
+
+    def get_device_tier(self, block: Block) -> int:
+        return self._device_tier.index(self.get_device(block))
+
+    def get_device_tier_from_id(self, block_id: int) -> int:
+        return self._device_tier.index(self.get_device_from_id(block_id))
+
+    def get_num_full_blocks_touched(self, blocks: List[Block],
+                                    device: Device) -> int:
         """Returns the number of full blocks that will be touched by
         swapping in/out the given blocks on to the 'device'.
 
@@ -296,7 +421,8 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         device = Device.GPU
         return self._allocators[device].clear_copy_on_writes()
 
-    def mark_blocks_as_accessed(self, block_ids: List[int], now: float) -> None:
+    def mark_blocks_as_accessed(self, block_ids: List[int],
+                                now: float) -> None:
         """Mark blocks as accessed, only use for prefix caching."""
         # Prefix caching only supported on GPU.
         device = Device.GPU
@@ -317,17 +443,14 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         # Prefix caching only supported on GPU.
         device = Device.GPU
         return self._allocators[device].get_computed_block_ids(
-            prev_computed_block_ids, block_ids, skip_last_block_id
-        )
+            prev_computed_block_ids, block_ids, skip_last_block_id)
 
     def get_common_computed_block_ids(
-        self, computed_seq_block_ids: List[List[int]]
-    ) -> List[int]:
+            self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         # Prefix caching only supported on GPU.
         device = Device.GPU
         return self._allocators[device].get_common_computed_block_ids(
-            computed_seq_block_ids
-        )
+            computed_seq_block_ids)
 
     @property
     def all_block_ids(self) -> FrozenSet[int]:
@@ -350,9 +473,22 @@ class MTBlockAllocator(DeviceAwareBlockAllocator):
         self._swap_mapping.clear()
         return list(mapping.items())
 
+    def get_and_reset_block_moving_record(
+        self, ) -> Dict[Tuple[Device, int], Tuple[Device, int]]:
+        return self._block_mover.get_and_reset_record()
+
+    def get_cached_block(self, content_hash: int) -> Optional[Block]:
+        return self._prefix_cache.get(content_hash)
+
+    def destroy(self, block: Block) -> None:
+        self._allocators[self.get_device(block)].destroy(block)
+
     def print_content(self, logger: Logger):
+        # TODO(noppanat): Remove this.
         for device, allocator in self._allocators.items():
-            logger.info(f"Device: {device}, Cached blocks: {allocator._cached_blocks}")
+            assert hasattr(allocator, "_prefix_cache")
+            logger.info("Device: %s, Cached blocks: %s", device,
+                        allocator._prefix_cache)  # type: ignore
 
 
 class NullBlock(Block):
@@ -385,7 +521,8 @@ class NullBlock(Block):
 
     @property
     def num_tokens_total(self) -> int:
-        raise NotImplementedError("num_tokens_total is not used for null block")
+        raise NotImplementedError(
+            "num_tokens_total is not used for null block")
 
     @property
     def num_empty_slots(self) -> BlockId:

@@ -187,7 +187,7 @@ class BlockTable:
             assert len(self._blocks) > 0
             self._blocks.append(
                 self._allocator.allocate_mutable_block(
-                    prev_block=self._blocks[-1], device=device))
+                    prev_block=self._blocks[-1], device=device).block)
 
     def fork(self) -> "BlockTable":
         """Creates a new BlockTable instance with a copy of the blocks from the
@@ -204,7 +204,9 @@ class BlockTable:
         """
         assert self._is_allocated
         assert len(self._blocks) > 0
-        forked_blocks = self._allocator.fork(self._blocks[-1])
+        forked_blocks = [
+            alloc.block for alloc in self._allocator.fork(self._blocks[-1])
+        ]
         return BlockTable(
             block_size=self._block_size,
             block_allocator=self._allocator,
@@ -276,7 +278,8 @@ class BlockTable:
 
         if block_token_ids:
             blocks.extend(
-                self._allocator.allocate_immutable_blocks(
+                alloc.block
+                for alloc in self._allocator.allocate_immutable_blocks(
                     prev_block, block_token_ids=block_token_ids,
                     device=device))
             prev_block = blocks[-1]
@@ -286,7 +289,7 @@ class BlockTable:
             cur_token_ids = tail_token_ids[0]
 
             block = self._allocator.allocate_mutable_block(
-                prev_block=prev_block, device=device)
+                prev_block=prev_block, device=device).block
             block.append_token_ids(cur_token_ids)
 
             blocks.append(block)

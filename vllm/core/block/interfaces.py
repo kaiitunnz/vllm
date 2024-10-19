@@ -1,12 +1,48 @@
+import enum
 from abc import ABC, abstractmethod
-from typing import Dict, FrozenSet, List, Optional, Protocol, Tuple
+from dataclasses import dataclass
+from typing import Dict, FrozenSet, List, Optional, Protocol, Sequence, Tuple
 
 from vllm.utils import Device
 
 BlockId = int
 
 
+class BlockState(enum.Enum):
+    """Enum for block state."""
+    UNINIT = enum.auto()
+    ALLOCATED = enum.auto()
+    EVICTED = enum.auto()
+    FREED = enum.auto()
+
+
+@dataclass
+class AllocationOutput:
+    block: "Block"
+    """Allocated block"""
+    evicted_block: Optional["Block"] = None
+    """Evicted block"""
+
+    def __post_init__(self):
+        assert self.evicted_block is None
+
+
 class Block(ABC):
+
+    def init_block_state(self) -> None:
+        # TODO(noppanat): remove this
+        self._trace: List[Tuple[BlockState, Optional[BlockId]]] = []
+        self.set_state(BlockState.UNINIT)
+
+    @property
+    def state(self) -> BlockState:
+        assert hasattr(self, "_state")
+        return self._state
+
+    def set_state(self, state: BlockState) -> None:
+        self._state = state
+        self._trace.append(
+            (state, self.block_id))  # TODO(noppanat): remove this
 
     @abstractmethod
     def append_token_ids(self, token_ids: List[int]) -> None:
@@ -99,18 +135,19 @@ class Block(ABC):
 class BlockAllocator(ABC):
 
     @abstractmethod
-    def allocate_mutable_block(self, prev_block: Optional[Block]) -> Block:
+    def allocate_mutable_block(
+            self, prev_block: Optional[Block]) -> AllocationOutput:
         pass
 
     @abstractmethod
     def allocate_immutable_block(self, prev_block: Optional[Block],
-                                 token_ids: List[int]) -> Block:
+                                 token_ids: List[int]) -> AllocationOutput:
         pass
 
     @abstractmethod
     def allocate_immutable_blocks(
             self, prev_block: Optional[Block],
-            block_token_ids: List[List[int]]) -> List[Block]:
+            block_token_ids: List[List[int]]) -> Sequence[AllocationOutput]:
         pass
 
     @abstractmethod
@@ -118,7 +155,11 @@ class BlockAllocator(ABC):
         pass
 
     @abstractmethod
-    def fork(self, last_block: Block) -> List[Block]:
+    def free_block_id(self, block_id: BlockId) -> None:
+        pass
+
+    @abstractmethod
+    def fork(self, last_block: Block) -> Sequence[AllocationOutput]:
         pass
 
     @abstractmethod
@@ -197,19 +238,20 @@ class DeviceAwareBlockAllocator(ABC):
 
     @abstractmethod
     def allocate_mutable_block(self, prev_block: Optional[Block],
-                               device: Device) -> Block:
+                               device: Device) -> AllocationOutput:
         pass
 
     @abstractmethod
     def allocate_immutable_block(self, prev_block: Optional[Block],
                                  token_ids: List[int],
-                                 device: Device) -> Block:
+                                 device: Device) -> AllocationOutput:
         pass
 
     @abstractmethod
-    def allocate_immutable_blocks(self, prev_block: Optional[Block],
-                                  block_token_ids: List[List[int]],
-                                  device: Device) -> List[Block]:
+    def allocate_immutable_blocks(
+            self, prev_block: Optional[Block],
+            block_token_ids: List[List[int]],
+            device: Device) -> Sequence[AllocationOutput]:
         pass
 
     @abstractmethod
@@ -225,7 +267,7 @@ class DeviceAwareBlockAllocator(ABC):
         pass
 
     @abstractmethod
-    def fork(self, last_block: Block) -> List[Block]:
+    def fork(self, last_block: Block) -> Sequence[AllocationOutput]:
         pass
 
     @property

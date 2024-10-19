@@ -1,23 +1,168 @@
 """A block manager that manages token blocks."""
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
-from typing import Tuple
+from typing import Set, Tuple
 
-from vllm.core.block.block_table import BlockTable
-from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
+from vllm.core.block.mt_block_allocator import MTPrefixAwareBlockAllocator
+from vllm.core.block.mt_block_table import MTBlockTable
+from vllm.core.block.mt_interfaces import MTDeviceAwareBlockAllocator
+from vllm.core.block.mt_prefix_caching_block import MTPrefixCachingBlock
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
-from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.core.interfaces import AllocStatus
+from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
-from vllm.utils import Device
+from vllm.utils import Device, cdiv, chunk_list
+
+logger = init_logger(__name__)
 
 SeqId = int
 EncoderSeqId = str
 
 
-class BlockSpaceManagerV2(BlockSpaceManager):
+class SequenceMeta:
+
+    def __init__(self, seq: Sequence, block_size: int,
+                 allocator: MTDeviceAwareBlockAllocator):
+        self._sequence = seq
+        self._allocator = allocator
+        (
+            self._cached_blocks,
+            self._cached_blocks_to_move_in,
+            self._full_block_token_ids,
+            self._tail_block_token_ids,
+        ) = self._split_sequence_tokens(seq.get_token_ids(), block_size)
+        self._num_required_blocks: Optional[int] = None
+
+    @property
+    def sequence(self):
+        return self._sequence
+
+    @property
+    def seq_id(self):
+        return self._sequence.seq_id
+
+    @property
+    def cached_blocks(self):
+        return self._cached_blocks
+
+    @property
+    def cached_blocks_to_move_in(self):
+        return self._cached_blocks_to_move_in
+
+    @property
+    def full_block_token_ids(self):
+        return self._full_block_token_ids
+
+    @property
+    def tail_block_token_ids(self):
+        return self._tail_block_token_ids
+
+    @property
+    def block_ids_in_use(self) -> Set[int]:
+        return {
+            block.block_id
+            for block in self._cached_blocks + self._cached_blocks_to_move_in
+            if block.block_id is not None
+        }
+
+    @property
+    def num_required_blocks(self) -> int:
+        assert (
+            self._num_required_blocks
+            is not None), "Number of required blocks has not been computed."
+        return self._num_required_blocks
+
+    def get_num_required_blocks(self, block_size: int,
+                                num_lookahead_slots: int) -> int:
+        if self._num_required_blocks is not None:
+            return self._num_required_blocks
+        num_tail_blocks = cdiv(
+            len(self._tail_block_token_ids) + num_lookahead_slots, block_size)
+        self._num_required_blocks = (len(self.cached_blocks_to_move_in) +
+                                     len(self.full_block_token_ids) +
+                                     num_tail_blocks)
+        return self._num_required_blocks
+
+    def _split_sequence_tokens(
+        self, token_ids: List[int], block_size: int
+    ) -> Tuple[List[Block], List[Block], List[List[int]], List[int]]:
+        """
+        Returns:
+            List[Block]: The blocks that are cached in the highest-tier device.
+            List[Block]: The blocks that are cached in lower-tier devices.
+            List[List[int]]: The blocks that are full but not cached.
+            List[int]: The tail block.
+        """
+        cached_blocks: List[Block] = []
+        cached_blocks_to_move_in: List[Block] = []
+        full_block_token_ids: List[List[int]] = []
+
+        block_token_ids: List[List[int]] = []
+        tail_block_token_ids: List[int] = []
+        for cur_token_ids in chunk_list(token_ids, block_size):
+            if len(cur_token_ids) == block_size:
+                block_token_ids.append(cur_token_ids)
+            else:
+                tail_block_token_ids = cur_token_ids
+
+        block_token_ids_iter = iter(block_token_ids)
+        content_hash = None
+        cached_block = None
+        # Highest-tier device
+        while (cur_block_token_ids := next(block_token_ids_iter,
+                                           None)) is not None:
+            content_hash, cached_block = self._get_cached_block(
+                content_hash,
+                cur_block_token_ids,
+            )
+            if cached_block is None:
+                full_block_token_ids.append(cur_block_token_ids)
+                break
+            if self._allocator.get_device_tier(cached_block) > 0:
+                cached_blocks_to_move_in.append(cached_block)
+                break
+            cached_blocks.append(cached_block)
+
+        # Lower-tier devices
+        if cached_block is not None:
+            while (cur_block_token_ids := next(block_token_ids_iter,
+                                               None)) is not None:
+                content_hash, cached_block = self._get_cached_block(
+                    content_hash,
+                    cur_block_token_ids,
+                )
+                if cached_block is None:
+                    full_block_token_ids.append(cur_block_token_ids)
+                    break
+                cached_blocks_to_move_in.append(cached_block)
+
+        # Uncached blocks
+        full_block_token_ids.extend(block_token_ids_iter)
+
+        return (
+            cached_blocks,
+            cached_blocks_to_move_in,
+            full_block_token_ids,
+            tail_block_token_ids,
+        )
+
+    def _get_cached_block(
+            self, prev_block_hash: Optional[int],
+            cur_block_token_ids: List[int]) -> Tuple[int, Optional[Block]]:
+        content_hash = MTPrefixCachingBlock.hash_block_tokens(
+            is_first_block=prev_block_hash is None,
+            prev_block_hash=prev_block_hash,
+            cur_block_token_ids=cur_block_token_ids,
+        )
+        cached_block = self._allocator.get_cached_block(content_hash)
+        return content_hash, cached_block
+
+
+# class MTBlockSpaceManager(BlockSpaceManager):
+class MTBlockSpaceManager:
     """BlockSpaceManager which manages the allocation of KV cache.
 
     It owns responsibility for allocation, swapping, allocating memory for
@@ -65,7 +210,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         num_cpu_blocks: int,
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
-        enable_caching: bool = False,
+        enable_caching: bool = True,
     ) -> None:
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
@@ -88,53 +233,56 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         assert watermark >= 0.0
 
         self.enable_caching = enable_caching
+        assert enable_caching
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
 
-        self.block_allocator = CpuGpuBlockAllocator.create(
+        self.block_allocator = MTPrefixAwareBlockAllocator.create(
             allocator_type="prefix_caching" if enable_caching else "naive",
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=block_size,
         )
 
-        self.block_tables: Dict[SeqId, BlockTable] = {}
-        self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
+        self.block_tables: Dict[SeqId, MTBlockTable] = {}
+        self.cross_block_tables: Dict[EncoderSeqId, MTBlockTable] = {}
 
         self._computed_blocks_tracker = ComputedBlocksTracker(
             self.block_allocator)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
 
+    def process_sequence_group(self, seq_group: SequenceGroup,
+                               status: SequenceStatus) -> List[SequenceMeta]:
+        return [
+            SequenceMeta(seq, self.block_size, self.block_allocator)
+            for seq in seq_group.get_seqs(status=status)
+        ]
+
+    def get_block_ids_in_use(self, seq_metas: List[SequenceMeta]) -> Set[int]:
+        return {
+            block_id
+            for seq_meta in seq_metas for block_id in seq_meta.block_ids_in_use
+        }
+
     def can_allocate(self,
                      seq_group: SequenceGroup,
+                     seq_metas: List[SequenceMeta],
+                     num_allocated_blocks: int = 0,
                      num_lookahead_slots: int = 0) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
 
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
-        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-        num_required_blocks = BlockTable.get_num_required_blocks(
-            seq.get_token_ids(),
-            block_size=self.block_size,
-            num_lookahead_slots=num_lookahead_slots,
-        )
-
-        if seq_group.is_encoder_decoder():
-            encoder_seq = seq_group.get_encoder_seq()
-            assert encoder_seq is not None
-            num_required_blocks += BlockTable.get_num_required_blocks(
-                encoder_seq.get_token_ids(),
-                block_size=self.block_size,
-            )
-
-        if self.max_block_sliding_window is not None:
-            num_required_blocks = min(num_required_blocks,
-                                      self.max_block_sliding_window)
+        num_required_blocks = self.get_num_required_blocks(
+            seq_group, seq_metas[0], num_lookahead_slots=num_lookahead_slots)
 
         num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
             device=Device.GPU)
+        # NOTE(noppanat): In this scheduler, we try allocating without actually
+        # allocating the blocks.
+        num_free_gpu_blocks -= num_allocated_blocks
 
         # Use watermark to avoid frequent cache eviction.
         if (self.num_total_gpu_blocks - num_required_blocks <
@@ -145,35 +293,72 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         else:
             return AllocStatus.LATER
 
-    def _allocate_sequence(self, seq: Sequence) -> BlockTable:
-        block_table = BlockTable(
+    def get_num_required_blocks(
+        self,
+        seq_group: SequenceGroup,
+        seq_meta: SequenceMeta,
+        num_lookahead_slots: int = 0,
+    ) -> int:
+        num_required_blocks = seq_meta.get_num_required_blocks(
+            self.block_size, num_lookahead_slots)
+
+        if seq_group.is_encoder_decoder():
+            raise NotImplementedError("Cross-attention is not yet supported.")
+            encoder_seq = seq_group.get_encoder_seq()
+            assert encoder_seq is not None
+            num_required_blocks += MTBlockTable.get_num_required_blocks(
+                encoder_seq.get_token_ids(),
+                block_size=self.block_size,
+            )
+
+        if self.max_block_sliding_window is not None:
+            num_required_blocks = min(num_required_blocks,
+                                      self.max_block_sliding_window)
+
+        return num_required_blocks
+
+    def _allocate_sequence(self, seq_meta: SequenceMeta,
+                           block_ids_in_use: Set[int]) -> MTBlockTable:
+        block_table = MTBlockTable(
             block_size=self.block_size,
             block_allocator=self.block_allocator,
             max_block_sliding_window=self.max_block_sliding_window,
         )
-        block_table.allocate(seq.get_token_ids())
+        block_table.allocate(
+            token_ids=seq_meta.sequence.get_token_ids(),
+            cached_blocks=seq_meta.cached_blocks,
+            cached_blocks_to_move_in=seq_meta.cached_blocks_to_move_in,
+            full_block_token_ids=seq_meta.full_block_token_ids,
+            tail_block_token_ids=seq_meta.tail_block_token_ids,
+            block_ids_in_use=block_ids_in_use,
+        )
 
         return block_table
 
-    def allocate(self, seq_group: SequenceGroup) -> None:
-
-        # Allocate self-attention block tables for decoder sequences
-        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
-        assert not (set(seq.seq_id for seq in waiting_seqs)
+    def allocate(
+        self,
+        seq_group: SequenceGroup,
+        seq_metas: List[SequenceMeta],
+        block_ids_in_use: Set[int],
+    ) -> None:
+        assert not (set(seq_meta.seq_id for seq_meta in seq_metas)
                     & self.block_tables.keys()), "block table already exists"
 
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
-        seq = waiting_seqs[0]
-        block_table: BlockTable = self._allocate_sequence(seq)
-        self.block_tables[seq.seq_id] = block_table
+        seq_meta = seq_metas[0]
+        assert seq_meta.sequence.status == SequenceStatus.WAITING
+        block_table = self._allocate_sequence(seq_meta, block_ids_in_use)
+        self.block_tables[seq_meta.seq_id] = block_table
 
         # Track seq
-        self._computed_blocks_tracker.add_seq(seq.seq_id)
-        self._last_access_blocks_tracker.add_seq(seq.seq_id)
+        self._computed_blocks_tracker.add_seq(seq_meta.seq_id)
+        self._last_access_blocks_tracker.add_seq(seq_meta.seq_id)
 
         # Assign the block table for each sequence.
-        for seq in waiting_seqs[1:]:
+        for seq_meta in seq_metas[1:]:
+            seq = seq_meta.sequence
+            assert seq.status == SequenceStatus.WAITING
             self.block_tables[seq.seq_id] = block_table.fork()
 
             # Track seq
@@ -193,6 +378,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
         if seq_group.is_encoder_decoder():
+            raise NotImplementedError("Cross-attention is not yet supported.")
             encoder_seq = seq_group.get_encoder_seq()
             assert encoder_seq is not None
             block_table = self._allocate_sequence(encoder_seq)
@@ -336,109 +522,29 @@ class BlockSpaceManagerV2(BlockSpaceManager):
 
     def can_swap_in(self, seq_group: SequenceGroup,
                     num_lookahead_slots: int) -> AllocStatus:
-        """Returns the AllocStatus for the given sequence_group 
+        """Returns the AllocStatus for the given sequence_group
         with num_lookahead_slots.
 
         Args:
             sequence_group (SequenceGroup): The sequence group to swap in.
-            num_lookahead_slots (int): Number of lookahead slots used in 
+            num_lookahead_slots (int): Number of lookahead slots used in
                 speculative decoding, default to 0.
 
         Returns:
             AllocStatus: The AllocStatus for the given sequence group.
         """
+        raise NotImplementedError("Swap in is not yet supported.")
         return self._can_swap(seq_group, Device.GPU, SequenceStatus.SWAPPED,
                               num_lookahead_slots)
 
     def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
-        """Returns the block id mapping (from CPU to GPU) generated by
-        swapping in the given seq_group with num_lookahead_slots.
-
-        Args:
-            seq_group (SequenceGroup): The sequence group to swap in.
-
-        Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from CPU 
-                to GPU.
-        """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
-                continue
-
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.CPU,
-                                                         dst_device=Device.GPU)
-
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
-
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id)
-                for cpu_block_id, gpu_block_id in seq_swap_mapping.items()
-            }
-
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
-
-        return physical_block_id_mapping
+        raise NotImplementedError("Swap in is not supported.")
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
-        """Returns whether we can swap out the given sequence_group 
-        with num_lookahead_slots.
-
-        Args:
-            seq_group (SequenceGroup): The sequence group to swap in.
-            num_lookahead_slots (int): Number of lookahead slots used in 
-                speculative decoding, default to 0.
-
-        Returns:
-            bool: Whether it's possible to swap out current sequence group.
-        """
-        alloc_status = self._can_swap(seq_group, Device.CPU,
-                                      SequenceStatus.RUNNING)
-        return alloc_status == AllocStatus.OK
+        raise NotImplementedError("Swap out is not supported.")
 
     def swap_out(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
-        """Returns the block id mapping (from GPU to CPU) generated by
-        swapping out the given sequence_group with num_lookahead_slots.
-
-        Args:
-            sequence_group (SequenceGroup): The sequence group to swap in.
-
-        Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from 
-                GPU to CPU.
-        """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
-                continue
-
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.GPU,
-                                                         dst_device=Device.CPU)
-
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
-
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id)
-                for gpu_block_id, cpu_block_id in seq_swap_mapping.items()
-            }
-
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
-
-        return physical_block_id_mapping
+        raise NotImplementedError("Swap out is not supported.")
 
     def get_num_free_gpu_blocks(self) -> int:
         return self.block_allocator.get_num_free_blocks(Device.GPU)
@@ -454,7 +560,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
                   device: Device,
                   status: SequenceStatus,
                   num_lookahead_slots: int = 0) -> AllocStatus:
-        """Returns the AllocStatus for swapping in/out the given sequence_group 
+        """Returns the AllocStatus for swapping in/out the given sequence_group
         on to the 'device'.
 
         Args:
@@ -462,13 +568,14 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             device (Device): device to swap the 'seq_group' on.
             status (SequenceStatus): The status of sequence which is needed
                 for action. RUNNING for swap out and SWAPPED for swap in
-            num_lookahead_slots (int): Number of lookahead slots used in 
+            num_lookahead_slots (int): Number of lookahead slots used in
                 speculative decoding, default to 0.
 
         Returns:
-            AllocStatus: The AllocStatus for swapping in/out the given 
+            AllocStatus: The AllocStatus for swapping in/out the given
                 sequence_group on to the 'device'.
         """
+        raise NotImplementedError("Swapping is not yet supported.")
         # First determine the number of blocks that will be touched by this
         # swap. Then verify if there are available blocks in the device
         # to perform the swap.
@@ -502,3 +609,11 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             return AllocStatus.OK
         else:
             return AllocStatus.LATER
+
+    def get_and_reset_block_moving_record(
+        self, ) -> Dict[Tuple[Device, int], Tuple[Device, int]]:
+        return self.block_allocator.get_and_reset_block_moving_record()
+
+    def print_content(self):
+        # TODO(noppanat): Remove this.
+        self.block_allocator.print_content(logger)  # type: ignore

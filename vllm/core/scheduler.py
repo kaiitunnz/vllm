@@ -9,6 +9,7 @@ from typing import (Callable, Deque, Dict, Iterable, List, Optional, Set,
 
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.core.mt_block_manager import MTBlockSpaceManager, SequenceMeta
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
@@ -257,6 +258,10 @@ class SchedulerPrefillOutputs:
     seq_groups: List[ScheduledSequenceGroup]
     # Ignored sequence groups.
     ignored_seq_groups: List[SequenceGroup]
+    # The blocks to swap in.
+    blocks_to_swap_in: List[Tuple[int, int]]
+    # The blocks to swap out.
+    blocks_to_swap_out: List[Tuple[int, int]]
     num_lookahead_slots: int
 
     @classmethod
@@ -264,6 +269,8 @@ class SchedulerPrefillOutputs:
         return SchedulerPrefillOutputs(
             seq_groups=[],
             ignored_seq_groups=[],
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
             num_lookahead_slots=0,
         )
 
@@ -316,6 +323,8 @@ class Scheduler:
             version = "v2"
         if self.scheduler_config.embedding_mode:
             version = "embedding"
+        if self.scheduler_config.use_mt_block_manager:
+            version = "mt"
 
         BlockSpaceManagerImpl = BlockSpaceManager.get_block_space_manager_class(
             version)
@@ -807,17 +816,17 @@ class Scheduler:
                                                       SequenceStatus.WAITING,
                                                       False, budget)
 
-            #Only preempt if priority inversion exists
+            # Only preempt if priority inversion exists
             while running_queue and self._get_priority(
                     running_queue[-1]) > self._get_priority(seq_group):
-                #Only preempt if waiting sequence cannot be allocated
+                # Only preempt if waiting sequence cannot be allocated
                 can_allocate = self.block_manager.can_allocate(seq_group)
                 if (num_new_tokens and can_allocate == AllocStatus.OK
                         and budget.can_schedule(num_new_tokens=num_new_tokens,
                                                 num_new_seqs=num_new_seqs)):
                     break
 
-                #Adjust budget to remove the victim sequence group
+                # Adjust budget to remove the victim sequence group
                 vseq_group = running_queue.pop()
                 num_running_tokens = self._get_num_new_tokens(
                     vseq_group, SequenceStatus.RUNNING, False, budget)
@@ -827,12 +836,12 @@ class Scheduler:
                 budget.subtract_num_seqs(vseq_group.request_id,
                                          num_running_seqs)
 
-                #Preempt out the victim sequence group
+                # Preempt out the victim sequence group
                 self._preempt(vseq_group, blocks_to_swap_out,
                               PreemptionMode.RECOMPUTE)
                 waiting_queue.appendleft(vseq_group)
                 force_preemption_count += 1
-            #Put the sequence back into the waiting queue
+            # Put the sequence back into the waiting queue
             waiting_queue.appendleft(seq_group)
 
         waiting_queue = deque(sorted(waiting_queue, key=self._get_priority))
@@ -870,6 +879,8 @@ class Scheduler:
         Returns:
             SchedulerPrefillOutputs.
         """
+        assert not isinstance(self.block_manager, MTBlockSpaceManager)
+
         ignored_seq_groups: List[SequenceGroup] = []
         seq_groups: List[ScheduledSequenceGroup] = []
 
@@ -979,6 +990,212 @@ class Scheduler:
         return SchedulerPrefillOutputs(
             seq_groups=seq_groups,
             ignored_seq_groups=ignored_seq_groups,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            num_lookahead_slots=self._get_num_lookahead_slots(
+                is_prefill=True, enable_chunking=enable_chunking))
+
+    def _schedule_prefills_mt_cache(
+        self,
+        budget: SchedulingBudget,
+        curr_loras: Optional[Set[int]],
+        enable_chunking: bool = False,
+    ) -> SchedulerPrefillOutputs:
+        """Schedule sequence groups that are in prefill stage.
+
+        Note that the current scheduler treats PREEMPTED_FOR_RECOMPUTE
+        as a new prefill (that starts from beginning -> most recently generated
+        tokens).
+
+        It schedules waiting requests as long as it fits `budget` and
+        curr_loras <= max_lora from the scheduling config. The input arguments
+        `budget` and `curr_loras` are updated based on scheduled seq_groups.
+
+        Args:
+            budget: The scheduling budget. The argument is in-place updated
+                when any requests are scheduled.
+            curr_loras: Currently batched lora request ids. The argument is
+                in-place updated when any requests are scheduled.
+            enable_chunking: If True, seq group can be chunked and only a
+                chunked number of tokens are scheduled  if
+                `budget.num_batched_tokens` has not enough capacity to schedule
+                all tokens.
+
+        Returns:
+            SchedulerPrefillOutputs.
+        """
+        assert isinstance(self.block_manager, MTBlockSpaceManager)
+        assert not enable_chunking
+
+        logger.info("[noppanat]: _schedule_prefills")
+        ignored_seq_groups: List[SequenceGroup] = []
+        seq_groups: List[ScheduledSequenceGroup] = []
+
+        waiting_queue = self.waiting
+
+        # Try allocating
+        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+        seq_groups_to_allocate: List[SequenceGroup] = []
+        seq_metas_to_allocate: List[List[SequenceMeta]] = []
+        num_allocated_blocks = 0
+        while waiting_queue:
+            if not self._passed_delay(time.time()):
+                logger.info("[noppanat]: timed out")
+                break
+
+            seq_group = waiting_queue[0]
+            waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+            assert len(waiting_seqs) == 1, (
+                "Waiting sequence group should have only one prompt "
+                "sequence.")
+            num_new_tokens = self._get_num_new_tokens(seq_group,
+                                                      SequenceStatus.WAITING,
+                                                      enable_chunking, budget)
+            if not enable_chunking:
+                num_prompt_tokens = waiting_seqs[0].get_len()
+                assert num_new_tokens == num_prompt_tokens
+
+            prompt_limit = self._get_prompt_limit(seq_group)
+            if num_new_tokens > prompt_limit:
+                logger.warning(
+                    "Input prompt (%d tokens) is too long"
+                    " and exceeds limit of %d", num_new_tokens, prompt_limit)
+                for seq in waiting_seqs:
+                    seq.status = SequenceStatus.FINISHED_IGNORED
+                ignored_seq_groups.append(seq_group)
+                waiting_queue.popleft()
+                continue
+
+            num_lookahead_slots: int = 0
+            if self.scheduler_config.is_multi_step and enable_chunking:
+                num_lookahead_slots = self._get_num_lookahead_slots(
+                    True, enable_chunking)
+
+            lora_int_id = 0
+            if self.lora_enabled:
+                lora_int_id = seq_group.lora_int_id
+                assert curr_loras is not None
+                assert self.lora_config is not None
+                if (self.lora_enabled and lora_int_id > 0
+                        and lora_int_id not in curr_loras
+                        and len(curr_loras) >= self.lora_config.max_loras):
+                    # We don't have a space for another LoRA, so
+                    # we ignore this request for now.
+                    leftover_waiting_sequences.appendleft(seq_group)
+                    waiting_queue.popleft()
+                    continue
+
+            num_new_seqs = seq_group.get_max_num_running_seqs()
+            if (num_new_tokens == 0
+                    or not budget.can_schedule(num_new_tokens=num_new_tokens,
+                                               num_new_seqs=num_new_seqs)):
+                break
+
+            # TODO(noppanat): Check the interface.
+            seq_metas = self.block_manager.process_sequence_group(
+                seq_group, status=SequenceStatus.WAITING)
+            logger.info(
+                "[noppanat]: seq_metas: %s, %s, %s, %s",
+                seq_metas[0].cached_blocks,
+                seq_metas[0].cached_blocks_to_move_in,
+                seq_metas[0].full_block_token_ids,
+                seq_metas[0].tail_block_token_ids,
+            )
+            assert len(seq_metas) == 1
+            # If the sequence group cannot be allocated, stop.
+            can_allocate = self.block_manager.can_allocate(
+                seq_group=seq_group,
+                seq_metas=seq_metas,
+                num_allocated_blocks=num_allocated_blocks,
+                num_lookahead_slots=num_lookahead_slots,
+            )
+            if can_allocate == AllocStatus.LATER:
+                break
+            elif can_allocate == AllocStatus.NEVER:
+                logger.warning(
+                    "Input prompt (%d tokens) + lookahead slots (%d) is "
+                    "too long and exceeds the capacity of block_manager",
+                    num_new_tokens, num_lookahead_slots)
+                for seq in waiting_seqs:
+                    seq.status = SequenceStatus.FINISHED_IGNORED
+                ignored_seq_groups.append(seq_group)
+                waiting_queue.popleft()
+                continue
+
+            # Allocate
+            waiting_queue.popleft()
+            seq_groups_to_allocate.append(seq_group)
+            seq_metas_to_allocate.append(seq_metas)
+            num_allocated_blocks += self.block_manager.get_num_required_blocks(
+                seq_group,
+                seq_metas[0],
+                num_lookahead_slots=num_lookahead_slots)
+
+        # Get the block IDs to be used in the next step.
+        block_ids_in_use = self.block_manager.get_block_ids_in_use([
+            seq_meta for seq_metas in seq_metas_to_allocate
+            for seq_meta in seq_metas
+        ])
+
+        logger.info("[noppanat]: seq_groups_to_allocate %s",
+                    seq_groups_to_allocate)
+
+        for seq_group, seq_metas in zip(seq_groups_to_allocate,
+                                        seq_metas_to_allocate):
+            # Can schedule this request.
+            if curr_loras is not None and seq_group.lora_int_id > 0:
+                curr_loras.add(seq_group.lora_int_id)
+            self._allocate_and_set_running(seq_group, seq_metas,
+                                           block_ids_in_use)
+
+            if enable_chunking and self.scheduler_config.is_multi_step:
+                blocks_to_copy: List[Tuple[int, int]] = []
+                # init_multi_step_from_lookahead_slots happens in append_slots
+                self._append_slots(seq_group, blocks_to_copy, enable_chunking)
+                # This assert will trip when a copy-on-write happens. This is
+                # not a concern as the very first sequence-group block
+                # allocation happens above. Still, we have the assert to
+                # catch any edge-cases.
+                assert not blocks_to_copy
+            else:
+                seq_group.init_multi_step_from_lookahead_slots(
+                    num_lookahead_slots,
+                    num_scheduler_steps=self.scheduler_config.
+                    num_scheduler_steps,
+                    is_multi_step=self.scheduler_config.is_multi_step,
+                    enable_chunking=enable_chunking)
+
+            seq_groups.append(
+                ScheduledSequenceGroup(seq_group=seq_group,
+                                       token_chunk_size=num_new_tokens))
+            budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
+            budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+
+        # Queue requests that couldn't be scheduled.
+        waiting_queue.extendleft(leftover_waiting_sequences)
+        if len(seq_groups) > 0:
+            self.prev_prompt = True
+
+        # Process block moving operations needed for the allocations
+        moving_record = self.block_manager.get_and_reset_block_moving_record()
+        blocks_to_swap_in = []
+        blocks_to_swap_out = []
+        # TODO(noppanat): Handle more device tiers.
+        for (dst_device,
+             dst_block_id), (src_device,
+                             src_block_id) in moving_record.items():
+            if src_device == Device.GPU and dst_device == Device.CPU:
+                blocks_to_swap_out.append((src_block_id, dst_block_id))
+            elif src_device == Device.CPU and dst_device == Device.GPU:
+                blocks_to_swap_in.append((src_block_id, dst_block_id))
+            else:
+                raise NotImplementedError("Unsupported block moving operation")
+
+        return SchedulerPrefillOutputs(
+            seq_groups=seq_groups,
+            ignored_seq_groups=ignored_seq_groups,
+            blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_swap_out=blocks_to_swap_out,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking))
 
@@ -990,6 +1207,7 @@ class Scheduler:
         decodes. If there's a pressure on GPU memory, decode requests can
         be swapped or preempted.
         """
+        logger.info("[noppanat]: _schedule_default")
         # Include running requests to the budget.
         budget = SchedulingBudget(
             token_budget=self.scheduler_config.max_num_batched_tokens,
@@ -1010,9 +1228,13 @@ class Scheduler:
 
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
-            prefills = self._schedule_prefills(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
+            if self.scheduler_config.use_mt_block_manager:
+                prefills = self._schedule_prefills_mt_cache(
+                    budget, curr_loras, enable_chunking=False)
+            else:
+                prefills = self._schedule_prefills(budget,
+                                                   curr_loras,
+                                                   enable_chunking=False)
 
         if len(prefills.seq_groups
                ) == 0 and self.scheduler_config.policy == "priority":
@@ -1073,12 +1295,22 @@ class Scheduler:
         ignored_seq_groups = prefills.ignored_seq_groups
         ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
 
+        if self.scheduler_config.use_mt_block_manager:
+            # NOTE(noppanat): Swapping is not supported.
+            assert len(swapped_in.blocks_to_swap_in) == 0
+            blocks_to_swap_in = prefills.blocks_to_swap_in
+            assert len(running_scheduled.blocks_to_swap_out) == 0
+            blocks_to_swap_out = prefills.blocks_to_swap_out
+        else:
+            blocks_to_swap_in = swapped_in.blocks_to_swap_in
+            blocks_to_swap_out = running_scheduled.blocks_to_swap_out
+
         return SchedulerOutputs(
             scheduled_seq_groups=scheduled_seq_groups,
             num_prefill_groups=num_prefill_groups,
             num_batched_tokens=budget.num_batched_tokens,
-            blocks_to_swap_in=swapped_in.blocks_to_swap_in,
-            blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
+            blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
             ignored_seq_groups=ignored_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
@@ -1100,6 +1332,7 @@ class Scheduler:
         inter token latency because decodes requests don't need to be blocked
         by prefill requests.
         """
+        logger.info("[noppanat]: _schedule_chunked_prefill")
         budget = SchedulingBudget(
             token_budget=self.scheduler_config.max_num_batched_tokens,
             max_num_seqs=self.scheduler_config.max_num_seqs,
@@ -1172,6 +1405,7 @@ class Scheduler:
 
     def _schedule(self) -> SchedulerOutputs:
         """Schedule queued requests."""
+        logger.info("[noppanat]: _schedule")
         if self.scheduler_config.chunked_prefill_enabled:
             return self._schedule_chunked_prefill()
         else:
@@ -1210,6 +1444,8 @@ class Scheduler:
     def schedule(
             self
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
+        # TODO(noppanat): remove this
+        self.block_manager.print_content()
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
@@ -1407,8 +1643,20 @@ class Scheduler:
 
             self._async_stopped.clear()
 
-    def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
-        self.block_manager.allocate(seq_group)
+    def _allocate_and_set_running(
+        self,
+        seq_group: SequenceGroup,
+        seq_metas: Optional[List[SequenceMeta]] = None,
+        block_ids_in_use: Optional[Set[int]] = None,
+    ) -> None:
+        if isinstance(self.block_manager, MTBlockSpaceManager):
+            assert seq_metas is not None
+            assert block_ids_in_use is not None
+            self.block_manager.allocate(seq_group=seq_group,
+                                        seq_metas=seq_metas,
+                                        block_ids_in_use=block_ids_in_use)
+        else:
+            self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
 

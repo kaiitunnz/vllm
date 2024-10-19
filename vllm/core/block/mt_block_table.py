@@ -1,12 +1,12 @@
 import math
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from vllm.core.block.common import BlockList
-from vllm.core.block.interfaces import Block, DeviceAwareBlockAllocator
+from vllm.core.block.mt_interfaces import Block, MTDeviceAwareBlockAllocator
 from vllm.utils import Device, cdiv, chunk_list
 
 
-class BlockTable:
+class MTBlockTable:
     """A class to manage blocks for a specific sequence.
 
     The BlockTable maps a sequence of tokens to a list of blocks, where each
@@ -41,7 +41,7 @@ class BlockTable:
     def __init__(
         self,
         block_size: int,
-        block_allocator: DeviceAwareBlockAllocator,
+        block_allocator: MTDeviceAwareBlockAllocator,
         _blocks: Optional[List[Block]] = None,
         max_block_sliding_window: Optional[int] = None,
     ):
@@ -78,9 +78,16 @@ class BlockTable:
         """
         return cdiv(len(token_ids) + num_lookahead_slots, block_size)
 
-    def allocate(self,
-                 token_ids: List[int],
-                 device: Device = Device.GPU) -> None:
+    def allocate(
+        self,
+        token_ids: List[int],
+        cached_blocks: List[Block],
+        cached_blocks_to_move_in: List[Block],
+        full_block_token_ids: List[List[int]],
+        tail_block_token_ids: List[int],
+        block_ids_in_use: Set[int],
+        device: Device = Device.GPU,
+    ) -> None:
         """Allocates memory blocks for storing the given sequence of token IDs.
 
         This method allocates the required number of blocks to store the given
@@ -93,9 +100,14 @@ class BlockTable:
         """
         assert not self._is_allocated
         assert token_ids
-        blocks = self._allocate_blocks_for_token_ids(prev_block=None,
-                                                     token_ids=token_ids,
-                                                     device=device)
+        blocks = self._allocate_blocks_for_token_ids(
+            cached_blocks=cached_blocks,
+            cached_blocks_to_move_in=cached_blocks_to_move_in,
+            full_block_token_ids=full_block_token_ids,
+            tail_block_token_ids=tail_block_token_ids,
+            block_ids_in_use=block_ids_in_use,
+            device=device,
+        )
         self.update(blocks)
         self._num_full_slots = len(token_ids)
 
@@ -185,11 +197,13 @@ class BlockTable:
 
         for _ in range(blocks_to_allocate):
             assert len(self._blocks) > 0
-            self._blocks.append(
-                self._allocator.allocate_mutable_block(
-                    prev_block=self._blocks[-1], device=device))
+            alloc = self._allocator.allocate_mutable_block(
+                prev_block=self._blocks[-1], device=device)
+            if alloc.evicted_block:
+                self._allocator.destroy(alloc.evicted_block)
+            self._blocks.append(alloc.block)
 
-    def fork(self) -> "BlockTable":
+    def fork(self) -> "MTBlockTable":
         """Creates a new BlockTable instance with a copy of the blocks from the
         current instance.
 
@@ -204,11 +218,11 @@ class BlockTable:
         """
         assert self._is_allocated
         assert len(self._blocks) > 0
-        forked_blocks = self._allocator.fork(self._blocks[-1])
-        return BlockTable(
+        forked_allocs = self._allocator.fork(self._blocks[-1])
+        return MTBlockTable(
             block_size=self._block_size,
             block_allocator=self._allocator,
-            _blocks=forked_blocks,
+            _blocks=[alloc.block for alloc in forked_allocs],
             max_block_sliding_window=self._max_block_sliding_window,
         )
 
@@ -261,35 +275,56 @@ class BlockTable:
         # ones after the appended ones.
         return sequence_token_ids[self.num_full_slots:]
 
-    def _allocate_blocks_for_token_ids(self, prev_block: Optional[Block],
-                                       token_ids: List[int],
-                                       device: Device) -> List[Block]:
+    def _allocate_blocks_for_token_ids(
+        self,
+        cached_blocks: List[Block],
+        cached_blocks_to_move_in: List[Block],
+        full_block_token_ids: List[List[int]],
+        tail_block_token_ids: List[int],
+        block_ids_in_use: Set[int],
+        device: Device,
+    ) -> List[Block]:
         blocks: List[Block] = []
 
-        block_token_ids = []
-        tail_token_ids = []
-        for cur_token_ids in chunk_list(token_ids, self._block_size):
-            if len(cur_token_ids) == self._block_size:
-                block_token_ids.append(cur_token_ids)
-            else:
-                tail_token_ids.append(cur_token_ids)
+        # Highest-tier device
+        for block in cached_blocks:
+            alloc = self._allocator.allocate_cached_block(block)
+            assert alloc.evicted_block is None
+        blocks.extend(cached_blocks)
 
-        if block_token_ids:
-            blocks.extend(
-                self._allocator.allocate_immutable_blocks(
-                    prev_block, block_token_ids=block_token_ids,
-                    device=device))
+        # Lower-tier devices
+        self._allocator.move_in(cached_blocks_to_move_in)
+        blocks.extend(cached_blocks_to_move_in)
+
+        blocks_to_move_out = []
+        prev_block = None
+        # Uncached blocks
+        if full_block_token_ids:
+            alloc_outputs = self._allocator.allocate_immutable_blocks(
+                prev_block,
+                block_token_ids=full_block_token_ids,
+                device=device,
+                block_ids_in_use=block_ids_in_use,
+            )
+            for alloc in alloc_outputs:
+                if alloc.evicted_block is not None:
+                    blocks_to_move_out.append(alloc.evicted_block)
+                blocks.append(alloc.block)
             prev_block = blocks[-1]
 
-        if tail_token_ids:
-            assert len(tail_token_ids) == 1
-            cur_token_ids = tail_token_ids[0]
+        # Tail block
+        if tail_block_token_ids:
+            alloc = self._allocator.allocate_mutable_block(
+                prev_block=prev_block,
+                device=device,
+                block_ids_in_use=block_ids_in_use)
+            alloc.block.append_token_ids(tail_block_token_ids)
+            if alloc.evicted_block is not None:
+                blocks_to_move_out.append(alloc.evicted_block)
+            blocks.append(alloc.block)
 
-            block = self._allocator.allocate_mutable_block(
-                prev_block=prev_block, device=device)
-            block.append_token_ids(cur_token_ids)
-
-            blocks.append(block)
+        # Perform hierarchical eviction
+        self._allocator.move_out(blocks_to_move_out)
 
         return blocks
 

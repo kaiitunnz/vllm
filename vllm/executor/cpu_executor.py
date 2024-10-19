@@ -337,12 +337,21 @@ def _verify_and_get_scheduler_config(
     if config.chunked_prefill_enabled:
         logger.warning("Chunked prefill is not supported on CPU, disable it.")
         config.chunked_prefill_enabled = False
+    if config.use_mt_block_manager:
+        logger.warning(
+            "Multi-tier block manager is not supported on CPU, disable it.")
+        config.use_mt_block_manager = False
 
     return config
 
 
 def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
-    if config.enable_prefix_caching:
+    if config.enable_multi_tier_prefix_caching:
+        logger.warning(
+            "Multi-tier prefix caching is not supported on CPU, disable it.")
+        config.enable_prefix_caching = False
+        config.enable_multi_tier_prefix_caching = False
+    elif config.enable_prefix_caching:
         logger.warning("Prefix caching is not supported on CPU, disable it.")
         config.enable_prefix_caching = False
 

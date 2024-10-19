@@ -106,6 +106,7 @@ class EngineArgs:
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
+    enable_multi_tier_prefix_caching: bool = False
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
@@ -147,6 +148,7 @@ class EngineArgs:
     num_scheduler_steps: int = 1
     multi_step_stream_outputs: bool = True
     ray_workers_use_nsight: bool = False
+    num_cpu_blocks_override: Optional[int] = None
     num_gpu_blocks_override: Optional[int] = None
     num_lookahead_slots: int = 0
     model_loader_extra_config: Optional[dict] = None
@@ -365,6 +367,9 @@ class EngineArgs:
         parser.add_argument('--enable-prefix-caching',
                             action='store_true',
                             help='Enables automatic prefix caching.')
+        parser.add_argument('--enable-multi-tier-prefix-caching',
+                            action='store_true',
+                            help='Enables multi-tier prefix caching.')
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '
@@ -414,6 +419,12 @@ class EngineArgs:
             'executor, which can range from 0 to 1. For example, a value of '
             '0.5 would imply 50%% GPU memory utilization. If unspecified, '
             'will use the default value of 0.9.')
+        parser.add_argument(
+            '--num-cpu-blocks-override',
+            type=int,
+            default=None,
+            help='If specified, ignore CPU profiling result and use this number'
+            'of CPU blocks. Used for testing preemption.')
         parser.add_argument(
             '--num-gpu-blocks-override',
             type=int,
@@ -908,9 +919,12 @@ class EngineArgs:
             gpu_memory_utilization=self.gpu_memory_utilization,
             swap_space=self.swap_space,
             cache_dtype=self.kv_cache_dtype,
+            num_cpu_blocks_override=self.num_cpu_blocks_override,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
+            enable_multi_tier_prefix_caching=self.
+            enable_multi_tier_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,
         )
         parallel_config = ParallelConfig(
@@ -1020,6 +1034,7 @@ class EngineArgs:
             max_num_seqs=self.max_num_seqs,
             max_model_len=model_config.max_model_len,
             use_v2_block_manager=self.use_v2_block_manager,
+            use_mt_block_manager=self.enable_multi_tier_prefix_caching,
             num_lookahead_slots=num_lookahead_slots,
             delay_factor=self.scheduler_delay_factor,
             enable_chunked_prefill=self.enable_chunked_prefill,

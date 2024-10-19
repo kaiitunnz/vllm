@@ -326,14 +326,14 @@ class Worker(LocalOrDistributedWorkerBase):
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
-        if (worker_input.blocks_to_swap_in is not None
-                and worker_input.blocks_to_swap_in.numel() > 0):
-            self.cache_engine[virtual_engine].swap_in(
-                worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
             self.cache_engine[virtual_engine].swap_out(
                 worker_input.blocks_to_swap_out)
+        if (worker_input.blocks_to_swap_in is not None
+                and worker_input.blocks_to_swap_in.numel() > 0):
+            self.cache_engine[virtual_engine].swap_in(
+                worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)

@@ -585,18 +585,22 @@ class CacheConfig:
         gpu_memory_utilization: float,
         swap_space: float,
         cache_dtype: str,
+        num_cpu_blocks_override: Optional[int] = None,
         num_gpu_blocks_override: Optional[int] = None,
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
+        enable_multi_tier_prefix_caching: bool = False,
         cpu_offload_gb: float = 0,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.swap_space_bytes = swap_space * GiB_bytes
+        self.num_cpu_blocks_override = num_cpu_blocks_override
         self.num_gpu_blocks_override = num_gpu_blocks_override
         self.cache_dtype = cache_dtype
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
+        self.enable_multi_tier_prefix_caching = enable_multi_tier_prefix_caching
         self.cpu_offload_gb = cpu_offload_gb
         self._verify_args()
         self._verify_cache_dtype()
@@ -630,6 +634,9 @@ class CacheConfig:
             raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
 
     def _verify_prefix_caching(self) -> None:
+        if self.enable_multi_tier_prefix_caching:
+            self.enable_prefix_caching = True
+
         if not self.enable_prefix_caching:
             return
 
@@ -947,6 +954,7 @@ class SchedulerConfig:
                  max_num_seqs: int,
                  max_model_len: int,
                  use_v2_block_manager: bool = True,
+                 use_mt_block_manager: bool = False,
                  num_lookahead_slots: int = 0,
                  delay_factor: float = 0.0,
                  enable_chunked_prefill: bool = False,
@@ -997,6 +1005,7 @@ class SchedulerConfig:
         self.max_num_seqs = max_num_seqs
         self.max_model_len = max_model_len
         self.use_v2_block_manager = use_v2_block_manager
+        self.use_mt_block_manager = use_mt_block_manager
         self.num_lookahead_slots = num_lookahead_slots
         self.delay_factor = delay_factor
         self.chunked_prefill_enabled = enable_chunked_prefill
@@ -1036,6 +1045,22 @@ class SchedulerConfig:
                 "num_scheduler_steps "
                 f"({self.num_scheduler_steps}) must be greater than or "
                 "equal to 1.")
+
+        if self.use_mt_block_manager:
+            if self.chunked_prefill_enabled:
+                logger.warning(
+                    "Chunked prefill is not supported with multi-tier block "
+                    "manager, disable it.")
+                self.chunked_prefill_enabled = False
+            if self.preemption_mode == "swap":
+                logger.warning(
+                    "Swap preemption is not supported with multi-tier block "
+                    "manager, change to recompute.")
+                self.preemption_mode = "recompute"
+            if self.use_v2_block_manager:
+                logger.info(
+                    "Multi-tier block manager is enabled. Block manager v2 "
+                    "will be used as a fallback.")
 
     @property
     def is_multi_step(self) -> bool:

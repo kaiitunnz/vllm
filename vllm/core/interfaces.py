@@ -5,7 +5,9 @@ from typing import Sequence as GenericSequence
 from typing import Tuple
 
 from vllm.sequence import Sequence, SequenceGroup
-from vllm.utils import Device
+from vllm.utils import Device, init_logger
+
+logger = init_logger(__name__)
 
 
 class AllocStatus(enum.Enum):
@@ -35,6 +37,10 @@ class BlockSpaceManager(ABC):
         if version == "v2":
             from vllm.core.block_manager_v2 import BlockSpaceManagerV2
             return BlockSpaceManagerV2
+
+        if version == "mt":
+            from vllm.core.mt_block_manager import MTBlockSpaceManager
+            return MTBlockSpaceManager
 
         if version == "embedding":
             from vllm.core.embedding_model_block_manager import (
@@ -125,3 +131,9 @@ class BlockSpaceManager(ABC):
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         """Prefix cache hit rate. -1 means not supported or disabled."""
         pass
+
+    def print_content(self):
+        # TODO(noppanat): Remove this.
+        if hasattr(self, "block_allocator") and hasattr(
+                self.block_allocator, "print_content"):
+            self.block_allocator.print_content(logger)  # type: ignore

@@ -2,7 +2,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Iterable, List, Optional, Protocol, Tuple
 
-from vllm.core.block.interfaces import Block, BlockAllocator
+from vllm.core.block.interfaces import (AllocationOutput, Block,
+                                        BlockAllocator, BlockState)
+from vllm.core.block.mt_interfaces import MTAllocationOutput, MTBlockAllocator
 
 BlockId = int
 RefCount = int
@@ -123,7 +125,7 @@ class CopyOnWriteTracker:
                    trg_block_id: Optional[BlockId]) -> None:
         """Records a copy-on-write operation from source to target block id
         Args:
-            src_block_id (BlockId): The source block id from which to copy 
+            src_block_id (BlockId): The source block id from which to copy
                 the data
             trg_block_id (BlockId): The target block id to which the data
                 is copied
@@ -170,14 +172,17 @@ class BlockPool:
         assert self._pool_size >= 0
 
         self._free_ids: Deque[int] = deque(range(self._pool_size))
-        self._pool = []
-        for i in range(self._pool_size):
-            self._pool.append(
-                self._create_block(prev_block=None,
-                                   token_ids=[],
-                                   block_size=self._block_size,
-                                   allocator=self._allocator,
-                                   block_id=None))
+        self._pool: List[Block] = []
+        for _ in range(self._pool_size):
+            block = self._create_block(
+                prev_block=None,
+                token_ids=[],
+                block_size=self._block_size,
+                allocator=self._allocator,
+                block_id=None,
+            )
+            block.init_block_state()
+            self._pool.append(block)
 
     def increase_pool(self):
         """Doubles the internal pool size
@@ -188,34 +193,256 @@ class BlockPool:
 
         self._free_ids += deque(range(cur_pool_size, new_pool_size))
 
-        for i in range(cur_pool_size, new_pool_size):
-            self._pool.append(
-                self._create_block(prev_block=None,
-                                   token_ids=[],
-                                   block_size=self._block_size,
-                                   allocator=self._allocator,
-                                   block_id=None))
+        for _ in range(cur_pool_size, new_pool_size):
+            block = self._create_block(
+                prev_block=None,
+                token_ids=[],
+                block_size=self._block_size,
+                allocator=self._allocator,
+                block_id=None,
+            )
+            block.init_block_state()
+            self._pool.append(block)
 
-    def init_block(self, prev_block: Optional[Block], token_ids: List[int],
-                   block_size: int, physical_block_id: Optional[int]) -> Block:
+    def _allocate_pool_id(self) -> int:
         if len(self._free_ids) == 0:
             self.increase_pool()
             assert len(self._free_ids) > 0
 
         pool_id = self._free_ids.popleft()
+        return pool_id
+
+    def init_block(self, prev_block: Optional[Block], token_ids: List[int],
+                   block_size: int, physical_block_id: Optional[int]) -> Block:
+        pool_id = self._allocate_pool_id()
 
         block = self._pool[pool_id]
+        assert block.state == BlockState.UNINIT
         block.__init__(  # type: ignore[misc]
             prev_block=prev_block,
             token_ids=token_ids,
             block_size=block_size,
-            allocator=block._allocator,  # type: ignore[attr-defined] 
+            allocator=block._allocator,  # type: ignore[attr-defined]
             block_id=physical_block_id)
         block.pool_id = pool_id  # type: ignore[attr-defined]
+        block.set_state(BlockState.ALLOCATED)
         return block
 
+    def copy_block(self, block: Block) -> Block:
+        pool_id = self._allocate_pool_id()
+
+        new_block = self._pool[pool_id]
+        assert new_block.state == BlockState.UNINIT
+        new_block.__init__(  # type: ignore[misc]
+            prev_block=block.prev_block,
+            token_ids=block.token_ids,
+            block_size=block.block_size,  # type: ignore[attr-defined]
+            allocator=block._allocator,  # type: ignore[attr-defined]
+            block_id=block.block_id,
+            computed=block.computed,
+        )
+        new_block.pool_id = pool_id  # type: ignore[attr-defined]
+        new_block.set_state(BlockState.ALLOCATED)
+        return new_block
+
     def free_block(self, block: Block) -> None:
+        block.set_state(BlockState.UNINIT)
         self._free_ids.appendleft(block.pool_id)  # type: ignore[attr-defined]
+
+
+class AllocationOutputPool:
+
+    def __init__(self, block_pool: BlockPool):
+        self._block_pool = block_pool
+        self._alloc_pool = self._create_alloc_pool()
+
+    @classmethod
+    def create(
+        cls,
+        block_size: int,
+        create_block: Block.Factory,
+        allocator: BlockAllocator,
+        pool_size: int,
+    ) -> "AllocationOutputPool":
+        block_pool = BlockPool(
+            block_size=block_size,
+            create_block=create_block,
+            allocator=allocator,
+            pool_size=pool_size,
+        )
+        return cls(block_pool)
+
+    @property
+    def block_pool(self) -> BlockPool:
+        return self._block_pool
+
+    def _create_alloc_pool(
+            self,
+            block_list: Optional[List[Block]] = None
+    ) -> List[AllocationOutput]:
+        if block_list is None:
+            block_list = self._block_pool._pool
+        return [AllocationOutput(block) for block in block_list]
+
+    def increase_pool(self):
+        """Increases pool to match the block pool size"""
+        cur_pool_size = self._block_pool._pool_size
+        self._alloc_pool.extend([
+            AllocationOutput(block)
+            for block in self._block_pool._pool[cur_pool_size:]
+        ])
+
+    def init_block(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        block_size: int,
+        physical_block_id: Optional[int],
+    ) -> Block:
+        block = self._block_pool.init_block(
+            prev_block=prev_block,
+            token_ids=token_ids,
+            block_size=block_size,
+            physical_block_id=physical_block_id,
+        )
+        if self._block_pool._pool_size > len(self._alloc_pool):
+            self.increase_pool()
+        return block
+
+    def copy_block(self, block: Block) -> Block:
+        block = self._block_pool.copy_block(block)
+        if self._block_pool._pool_size > len(self._alloc_pool):
+            self.increase_pool()
+        return block
+
+    def wrap_block(self, block: Block) -> AllocationOutput:
+        assert hasattr(block, "pool_id"), "Block must be from the pool"
+        alloc = self._alloc_pool[block.pool_id]  # type: ignore[attr-defined]
+        alloc.__init__(block=alloc.block,
+                       evicted_block=None)  # type: ignore[misc]
+        return alloc
+
+    def init_alloc_output(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        block_size: int,
+        physical_block_id: Optional[int],
+    ) -> AllocationOutput:
+        block = self.init_block(
+            prev_block=prev_block,
+            token_ids=token_ids,
+            block_size=block_size,
+            physical_block_id=physical_block_id,
+        )
+        alloc = self.wrap_block(block)
+        return alloc
+
+    def free_block(self, block: Block) -> None:
+        self._block_pool.free_block(block)
+
+    def free_alloc_output(self, alloc: AllocationOutput) -> None:
+        self.free_block(alloc.block)
+
+
+class MTAllocationOutputPool:
+
+    def __init__(self, block_pool: BlockPool):
+        self._block_pool = block_pool
+        self._alloc_pool = self._create_alloc_pool()
+
+    @classmethod
+    def create(
+        cls,
+        block_size: int,
+        create_block: Block.Factory,
+        allocator: MTBlockAllocator,
+        pool_size: int,
+    ) -> "MTAllocationOutputPool":
+        block_pool = BlockPool(
+            block_size=block_size,
+            create_block=create_block,
+            allocator=allocator,
+            pool_size=pool_size,
+        )
+        return cls(block_pool)
+
+    @property
+    def block_pool(self) -> BlockPool:
+        return self._block_pool
+
+    def _create_alloc_pool(
+            self,
+            block_list: Optional[List[Block]] = None
+    ) -> List[MTAllocationOutput]:
+        if block_list is None:
+            block_list = self._block_pool._pool
+        return [MTAllocationOutput(block) for block in block_list]
+
+    def increase_pool(self):
+        """Increases pool to match the block pool size"""
+        cur_pool_size = self._block_pool._pool_size
+        self._alloc_pool.extend([
+            MTAllocationOutput(block)
+            for block in self._block_pool._pool[cur_pool_size:]
+        ])
+
+    def init_block(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        block_size: int,
+        physical_block_id: Optional[int],
+    ) -> Block:
+        block = self._block_pool.init_block(
+            prev_block=prev_block,
+            token_ids=token_ids,
+            block_size=block_size,
+            physical_block_id=physical_block_id,
+        )
+        if self._block_pool._pool_size > len(self._alloc_pool):
+            self.increase_pool()
+        return block
+
+    def copy_block(self, block: Block) -> Block:
+        block = self._block_pool.copy_block(block)
+        if self._block_pool._pool_size > len(self._alloc_pool):
+            self.increase_pool()
+        return block
+
+    def wrap_block(
+        self,
+        block: Block,
+        evicted_block: Optional[Block] = None,
+    ) -> MTAllocationOutput:
+        assert hasattr(block, "pool_id"), "Block must be from the pool"
+        alloc = self._alloc_pool[block.pool_id]  # type: ignore[attr-defined]
+        alloc.__init__(block=alloc.block,
+                       evicted_block=evicted_block)  # type: ignore[misc]
+        return alloc
+
+    def init_alloc_output(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        block_size: int,
+        physical_block_id: Optional[int],
+        evicted_block: Optional[Block] = None,
+    ) -> MTAllocationOutput:
+        block = self.init_block(
+            prev_block=prev_block,
+            token_ids=token_ids,
+            block_size=block_size,
+            physical_block_id=physical_block_id,
+        )
+        alloc = self.wrap_block(block, evicted_block)
+        return alloc
+
+    def free_block(self, block: Block) -> None:
+        self._block_pool.free_block(block)
+
+    def free_alloc_output(self, alloc: MTAllocationOutput) -> None:
+        self.free_block(alloc.block)
 
 
 class BlockList:

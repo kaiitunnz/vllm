@@ -1,24 +1,67 @@
 from os.path import commonprefix
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
-from vllm.core.block.common import (
-    CacheMetricData,
-    CopyOnWriteTracker,
-    get_all_blocks_recursively,
-)
-from vllm.core.block.interfaces import Block, BlockAllocator, BlockId, Device
-from vllm.core.block.naive_block import BlockPool, NaiveBlock, NaiveBlockAllocator
-from vllm.core.block.prefix_caching_block import (
-    BlockTracker,
-    PrefixCachingBlock,
-    PrefixCachingBlockAllocator,
-    PrefixHash,
-    _DEFAULT_LAST_ACCESSED_TIME,
-)
-from vllm.core.evictor_v2 import EvictionPolicy, Evictor, make_evictor
+from vllm.core.block.common import (CacheMetricData, CopyOnWriteTracker,
+                                    MTAllocationOutputPool,
+                                    get_all_blocks_recursively)
+from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
+                                        BlockState, Device)
+from vllm.core.block.mt_interfaces import MTAllocationOutput, MTBlockAllocator
+from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
+from vllm.core.block.prefix_caching_block import BlockTracker, PrefixHash
+from vllm.core.mt_evictor import EvictionPolicy, MTEvictor, make_mt_evictor
+from vllm.utils import init_logger
+
+logger = init_logger(__name__)
+
+_DEFAULT_LAST_ACCESSED_TIME = -1
 
 
-class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
+class PrefixCache:
+
+    def __init__(
+        self,
+        prefix_cache: Optional[Dict[PrefixHash, Block]] = None,
+        block_ids: Optional[FrozenSet[int]] = None,
+    ):
+        self._prefix_cache = {} if prefix_cache is None else prefix_cache
+        self._block_ids = block_ids
+
+    def subset(self,
+               block_ids: Optional[FrozenSet[int]] = None) -> "PrefixCache":
+        return PrefixCache(self._prefix_cache, block_ids)
+
+    def get(self, content_hash: PrefixHash) -> Optional[Block]:
+        logger.info("[noppanat] get content_hash=%s, self=%s", content_hash,
+                    self)
+        block = self._prefix_cache.get(content_hash, None)
+        if ((block is None) or (self._block_ids is None)
+                # or (block.block_id is None)   # TODO(noppanat): Check this.
+                or (block.block_id in self._block_ids)):
+            return block
+        return None
+
+    def add(self, content_hash: PrefixHash, block: Block) -> None:
+        if self._block_ids is not None:
+            assert block.block_id in self._block_ids
+        self._prefix_cache[content_hash] = block
+
+    def pop(self, content_hash: PrefixHash) -> Optional[Block]:
+        block = self._prefix_cache.pop(content_hash, None)
+        if block is None:
+            return None
+        if self._block_ids is not None:
+            assert block.block_id in self._block_ids
+        return block
+
+    def __contains__(self, key: PrefixHash) -> bool:
+        return self.get(key) is not None
+
+    def __repr__(self) -> str:
+        return repr({k: v for k, v in self._prefix_cache.items()})
+
+
+class MTPrefixCachingBlockAllocator(MTBlockAllocator):
     """A block allocator that implements prefix caching.
 
     The MTPrefixCachingBlockAllocator maintains a cache of blocks based on their
@@ -38,16 +81,13 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         num_blocks: int,
         block_size: int,
         block_ids: Optional[Iterable[int]] = None,
+        prefix_cache: Optional[PrefixCache] = None,
         eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
     ):
         if block_ids is None:
             block_ids = range(num_blocks)
 
         self._block_size = block_size
-
-        # A mapping of prefix hash to block index. All blocks which have a
-        # prefix hash will be in this dict, even if they have refcount 0.
-        self._cached_blocks: Dict[PrefixHash, BlockId] = {}
 
         # A list of immutable block IDs that have been touched by scheduler
         # and should be marked as computed after an entire batch of sequences
@@ -63,9 +103,9 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         # The "* extra_factor" is a buffer to allow more block objects
         # than physical blocks
         extra_factor = 4
-        self._block_pool = BlockPool(
-            self._block_size, self._create_block, self, num_blocks * extra_factor
-        )
+        self._alloc_pool = MTAllocationOutputPool.create(
+            self._block_size, self._create_block, self,
+            num_blocks * extra_factor)
 
         # An allocator for blocks that do not have prefix hashes.
         self._hashless_allocator = NaiveBlockAllocator(
@@ -73,12 +113,19 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             num_blocks=num_blocks,
             block_size=block_size,
             block_ids=block_ids,
-            block_pool=self._block_pool,  # Share block pool here
+            block_pool=self._alloc_pool.block_pool,  # Share block pool here
         )
+
+        # A mapping of prefix hash to block index. All blocks which have a
+        # prefix hash will be in this dict, even if they have refcount 0.
+        self._prefix_cache = (
+            PrefixCache(block_ids=self.all_block_ids) if prefix_cache is None
+            else prefix_cache.subset(self.all_block_ids)
+        )  # TODO(noppanat): may not be necessary.
 
         # Evitor used to maintain how we want to handle those computed blocks
         # if we find memory pressure is high.
-        self.evictor: Evictor = make_evictor(eviction_policy)
+        self.evictor: MTEvictor = make_mt_evictor(eviction_policy)
 
         # We share the refcounter between allocators. This allows us to promote
         # blocks originally allocated in the hashless allocator to immutable
@@ -86,8 +133,7 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         self._refcounter = self._hashless_allocator.refcounter
 
         self._cow_tracker = CopyOnWriteTracker(
-            refcounter=self._refcounter.as_readonly()
-        )
+            refcounter=self._refcounter.as_readonly())
 
         self.metric_data = CacheMetricData()
 
@@ -118,7 +164,8 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         prev_block: Optional[Block],
         token_ids: List[int],
         device: Optional[Device] = None,
-    ) -> Block:
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> MTAllocationOutput:
         """Allocates an immutable block with the given token IDs, reusing cached
         blocks if possible.
 
@@ -132,46 +179,105 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         assert device is None
         assert_prefix_caching_block_or_none(prev_block)
 
-        # First, try to create a block that points to cached data
-        block = self._block_pool.init_block(
-            prev_block=prev_block,
-            token_ids=token_ids,
-            block_size=self._block_size,
-            physical_block_id=None,
-        )
-        assert block.content_hash is not None
+        # Check if the block is already cached
+        if prev_block is None:
+            content_hash = MTPrefixCachingBlock.hash_block_tokens(
+                is_first_block=True,
+                prev_block_hash=None,
+                cur_block_token_ids=token_ids)
+        else:
+            content_hash = MTPrefixCachingBlock.hash_block_tokens(
+                is_first_block=False,
+                prev_block_hash=prev_block.content_hash,
+                cur_block_token_ids=token_ids,
+            )
+        cached_block = self._prefix_cache.get(content_hash)
+        if cached_block is not None:
+            return self.allocate_cached_block(cached_block)
 
-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
-        if cached_block_id is not None:
-            self.metric_data.query(hit=True)
-            block.block_id = cached_block_id
-            self._incr_refcount_cached_block(block)
-            return block
+        # # Check if the block is already cached
+        # # TODO(noppanat): remove this for performance.
+        # if prev_block is None:
+        #     content_hash = MTPrefixCachingBlock.hash_block_tokens(
+        #         is_first_block=True,
+        #         prev_block_hash=None,
+        #         cur_block_token_ids=token_ids
+        #     )
+        # else:
+        #     content_hash = MTPrefixCachingBlock.hash_block_tokens(
+        #         is_first_block=False,
+        #         prev_block_hash=prev_block.content_hash,
+        #         cur_block_token_ids=token_ids,
+        #     )
+        # # NOTE(noppanat): Avoiding hash computation for performance.
+        # assert (
+        #     self._prefix_cache.get(content_hash) is None
+        # ), "Block is already cached. Use allocate_cached_block instead."
+
+        # # First, try to create a block that points to cached data
+        # block = self._alloc_pool.init_block(
+        #     prev_block=prev_block,
+        #     token_ids=token_ids,
+        #     block_size=self._block_size,
+        #     physical_block_id=None,
+        # )
+        # assert block.content_hash is not None
+
+        # cached_block_id = self._cached_blocks.get(block.content_hash, None)
+        # if cached_block_id is not None:
+        #     self.metric_data.query(hit=True)
+        #     block.block_id = cached_block_id
+        #     self._incr_refcount_cached_block(block)
+        #     alloc = self._alloc_pool.wrap_block(block)
+        #     return alloc
+        # self._alloc_pool.free_block(block)
         self.metric_data.query(hit=False)
-        self._block_pool.free_block(block)
 
         # No cached block => Allocate a new block
-        block = self.allocate_mutable_block(prev_block)
-        block.append_token_ids(token_ids)
-        return block
+        alloc = self.allocate_mutable_block(prev_block,
+                                            block_ids_in_use=block_ids_in_use)
+        alloc.block.append_token_ids(token_ids)
+        return alloc
+
+    def allocate_cached_block(self, block: Block) -> MTAllocationOutput:
+        """Allocates a block that is already cached."""
+        assert block.content_hash is not None
+        assert block.content_hash in self._prefix_cache
+        assert block.block_id is not None
+
+        new_block = self._alloc_pool.copy_block(block)
+        assert new_block.content_hash is not None
+        self.metric_data.query(hit=True)
+        self._incr_refcount_cached_block(new_block)
+
+        alloc = self._alloc_pool.wrap_block(new_block)
+        return alloc
 
     def allocate_immutable_blocks(
         self,
         prev_block: Optional[Block],
         block_token_ids: List[List[int]],
         device: Optional[Device] = None,
-    ) -> List[Block]:
-        blocks = []
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> List[MTAllocationOutput]:
+        allocs: List[MTAllocationOutput] = []
         for token_ids in block_token_ids:
-            prev_block = self.allocate_immutable_block(
-                prev_block=prev_block, token_ids=token_ids, device=device
+            prev_alloc = self.allocate_immutable_block(
+                prev_block=prev_block,
+                token_ids=token_ids,
+                device=device,
+                block_ids_in_use=block_ids_in_use,
             )
-            blocks.append(prev_block)
-        return blocks
+            prev_block = prev_alloc.block
+            allocs.append(prev_alloc)
+        return allocs
 
     def allocate_mutable_block(
-        self, prev_block: Optional[Block], device: Optional[Device] = None
-    ) -> Block:
+        self,
+        prev_block: Optional[Block],
+        device: Optional[Device] = None,
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> MTAllocationOutput:
         """Allocates a mutable block. If there are no free blocks, this will
         evict unused cached blocks.
 
@@ -185,16 +291,17 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         assert device is None
         assert_prefix_caching_block_or_none(prev_block)
 
-        block_id = self._allocate_block_id()
-        block = self._block_pool.init_block(
+        block_id, evicted_block = self._allocate_block_id(block_ids_in_use)
+        alloc = self._alloc_pool.init_alloc_output(
             prev_block=prev_block,
             token_ids=[],
             block_size=self._block_size,
             physical_block_id=block_id,
+            evicted_block=evicted_block,
         )
-        assert not block.computed
-        assert block.content_hash is None
-        return block
+        assert not alloc.block.computed
+        assert alloc.block.content_hash is None
+        return alloc
 
     def _incr_refcount_cached_block(self, block: Block) -> None:
         # Set this block to be "computed" since it is pointing to a
@@ -221,27 +328,25 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
 
         refcount = self._refcounter.decr(block_id)
         if refcount > 0:
-            block.block_id = None
+            # block.block_id = None # TODO(noppanat): Check this.
             return
         else:
             assert refcount == 0
 
         # No longer used
-        assert block.content_hash in self._cached_blocks
+        assert block.content_hash in self._prefix_cache
 
         # Add the cached block to the evictor
         # (This keeps the cached block around so it can be reused)
         self.evictor.add(
-            block_id,
-            block.content_hash,
-            block.num_tokens_total,
+            block,
             self._block_tracker[block_id].last_accessed,
         )
 
         # Stop tracking the block
         self._untrack_block_id(block_id)
 
-        block.block_id = None
+        # block.block_id = None # TODO(noppanat): Check this.
 
     def _decr_refcount_hashless_block(self, block: Block) -> None:
         block_id = block.block_id
@@ -257,34 +362,50 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         # itself (will be handled by the caller)
         self._hashless_allocator.free(block, keep_block_object=True)
 
-    def _allocate_block_id(self) -> BlockId:
+    def _allocate_block_id(
+        self,
+        block_ids_in_use: Optional[Set[BlockId]] = None
+    ) -> Tuple[BlockId, Optional[Block]]:
         """First tries to allocate a block id from the hashless allocator,
         and if there are no blocks, then tries to evict an unused cached block.
+
+        Returns
+        -------
+        block_id: BlockId
+            The allocated block id.
+        to_swap_in: List[BlockId]
+            The list of block ids that need to be swapped in.
+        to_swap_out: List[BlockId]
+            The list of block ids that need to be swapped out.
         """
         hashless_block_id = self._maybe_allocate_hashless_block_id()
         if hashless_block_id is not None:
-            return hashless_block_id
+            return hashless_block_id, None
 
-        evicted_block_id = self._maybe_allocate_evicted_block_id()
-        if evicted_block_id is not None:
-            return evicted_block_id
+        alloc = self._maybe_allocate_evicted_block_id(block_ids_in_use)
+        if alloc is not None:
+            return alloc
 
         # No block available in hashless allocator, nor in unused cache blocks.
-        raise BlockAllocator.NoFreeBlocksError()
+        raise MTBlockAllocator.NoFreeBlocksError()
 
     def _maybe_allocate_hashless_block_id(self) -> Optional[BlockId]:
         try:
             # Allocate mutable block and extract its block_id
-            block = self._hashless_allocator.allocate_mutable_block(prev_block=None)
-            block_id = block.block_id
-            self._block_pool.free_block(block)
+            alloc = self._hashless_allocator.allocate_mutable_block(
+                prev_block=None)
+            block_id = alloc.block.block_id
+            self._hashless_allocator._alloc_pool.free_alloc_output(alloc)
 
             self._track_block_id(block_id, computed=False)
             return block_id
-        except BlockAllocator.NoFreeBlocksError:
+        except MTBlockAllocator.NoFreeBlocksError:
             return None
 
-    def _maybe_allocate_evicted_block_id(self) -> Optional[BlockId]:
+    def _maybe_allocate_evicted_block_id(
+        self,
+        block_ids_in_use: Optional[Set[BlockId]] = None
+    ) -> Optional[Tuple[BlockId, Optional[Block]]]:
         if self.evictor.num_blocks == 0:
             return None
 
@@ -292,20 +413,36 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         # into evictor if its ref counter is 0
         # and since its content would be changed, we need
         # to remove it from _cached_blocks's tracking list
-        block_id, content_hash_to_evict = self.evictor.evict()
+        evicted_block: Optional[Block] = self.evictor.evict(block_ids_in_use)
+        assert evicted_block is not None
+        assert evicted_block.block_id is not None
+        assert evicted_block.content_hash is not None
+        block_id = evicted_block.block_id
+        content_hash_to_evict = evicted_block.content_hash
 
         # Sanity checks
-        assert content_hash_to_evict in self._cached_blocks
-        _block_id = self._cached_blocks[content_hash_to_evict]
-        assert self._refcounter.get(_block_id) == 0
-        assert _block_id == block_id
+        assert evicted_block.state == BlockState.EVICTED
+        cached_block = self._prefix_cache.get(content_hash_to_evict)
+        assert cached_block is not None
+        _block_id = cached_block.block_id
+        assert _block_id is not None
+        if block_id != _block_id:
+            # TODO(noppanat): Remove this.
+            # In this case, the block has been recomputed by the running
+            # sequences and is already in the highest-tier device.
+            logger.warning("Evicted block has been recomputed.")
+            self.destroy(evicted_block, keep_prefix_cache=True)
+            evicted_block = None
 
-        self._cached_blocks.pop(content_hash_to_evict)
+        # assert _block_id is not None
+        assert self._refcounter.get(block_id) == 0
+
+        # self._cached_blocks.pop(content_hash_to_evict)
 
         self._refcounter.incr(block_id)
         self._track_block_id(block_id, computed=False)
 
-        return block_id
+        return block_id, evicted_block
 
     def _free_block_id(self, block: Block) -> None:
         """Decrements the refcount of the block. The block may be in two
@@ -315,6 +452,12 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         allocator free(..) with keep_block_object=True is called to only free
         the block id (since the block object may be reused by the caller)
         """
+        assert block.state == BlockState.ALLOCATED, "[noppanat] "
+        f"block.trace={block._trace}, "
+        f"block_id={block.block_id}, "
+        f"computed={block.computed}, "
+        f"content_hash={block.content_hash}, "
+        f"last_accessed={block.last_accessed}"
         block_id = block.block_id
         assert block_id is not None, "Freeing unallocated block is undefined"
 
@@ -327,7 +470,7 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             # directly to the hashless allocator
             self._decr_refcount_hashless_block(block)
 
-        assert block.block_id is None
+        # assert block.block_id is None # TODO(noppanat): Check this.
 
     def free(self, block: Block, keep_block_object: bool = False) -> None:
         """Release the block (look at free_block_id(..) docs)"""
@@ -335,10 +478,21 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         self._free_block_id(block)
 
         # Release the block object to the pool
-        if not keep_block_object:
-            self._block_pool.free_block(block)
+        # if not keep_block_object:
+        #     self._alloc_pool.free_block(block)
 
-    def fork(self, last_block: Block) -> List[Block]:
+    def free_block_id(self, block_id: BlockId) -> None:
+        raise NotImplementedError(
+            "free_block_id is not supported in MTPrefixCachingBlockAllocator")
+
+    def destroy(self, block: Block, keep_prefix_cache: bool = False) -> None:
+        assert block.state == BlockState.EVICTED
+        if not keep_prefix_cache:
+            assert block.content_hash is not None
+            self._prefix_cache.pop(block.content_hash)
+        self._alloc_pool.free_block(block)
+
+    def fork(self, last_block: Block) -> List[MTAllocationOutput]:
         """Creates a new sequence of blocks that shares the same underlying
         memory as the original sequence.
 
@@ -349,34 +503,38 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             List[Block]: The new sequence of blocks that shares the same memory
                 as the original sequence.
         """
+        raise NotImplementedError("Forking is not yet supported.")
         source_blocks = get_all_blocks_recursively(last_block)
 
-        forked_blocks: List[Block] = []
+        forked_allocs: List[MTAllocationOutput] = []
         prev_block = None
         for block in source_blocks:
             block_id = block.block_id
             assert block_id is not None
 
             refcount = self._refcounter.incr(block_id)
-            assert refcount != 1, "can't fork free'd block_id = {}".format(block_id)
+            assert refcount != 1, "can't fork free'd block_id = {}".format(
+                block_id)
 
-            forked_block = self._block_pool.init_block(
+            forked_alloc = self._alloc_pool.init_alloc_output(
                 prev_block=prev_block,
                 token_ids=block.token_ids,
                 block_size=self._block_size,
                 physical_block_id=block_id,
             )
 
-            forked_blocks.append(forked_block)
-            prev_block = forked_blocks[-1]
+            forked_allocs.append(
+                forked_alloc)  # TODO(noppanat): check swapping logic
+            prev_block = forked_allocs[-1]
 
-        return forked_blocks
+        return forked_allocs
 
     def get_num_free_blocks(self, device: Optional[Device] = None) -> int:
         assert device is None
         # The number of free blocks is the number of hashless free blocks
         # plus the number of blocks evictor could free from its list.
-        return self._hashless_allocator.get_num_free_blocks() + self.evictor.num_blocks
+        return self._hashless_allocator.get_num_free_blocks(
+        ) + self.evictor.num_blocks
 
     def get_num_total_blocks(self) -> int:
         return self._hashless_allocator.get_num_total_blocks()
@@ -403,7 +561,7 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
 
     def is_block_cached(self, block: Block) -> bool:
         assert block.content_hash is not None
-        return block.content_hash in self._cached_blocks
+        return block.content_hash in self._prefix_cache
 
     def promote_to_immutable_block(self, block: Block) -> BlockId:
         """Once a mutable block is full, it can be promoted to an immutable
@@ -426,12 +584,14 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         assert block.block_id is not None
         assert self._refcounter.get(block.block_id) > 0
 
-        if block.content_hash not in self._cached_blocks:
+        cached_block = self._prefix_cache.get(block.content_hash)
+
+        if cached_block is None:
             # No cached content hash => Set this block as cached.
             # Note that this block cannot be marked as computed yet
             # because other sequences in the same batch cannot reuse
             # this block.
-            self._cached_blocks[block.content_hash] = block.block_id
+            self._prefix_cache.add(block.content_hash, block)
             # Mark this block as touched so that it can be marked as
             # computed after the entire batch of sequences are scheduled.
             self._touched_blocks.add(block.block_id)
@@ -439,7 +599,13 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
 
         # Reuse the cached content hash
         self._decr_refcount_hashless_block(block)
-        block.block_id = self._cached_blocks[block.content_hash]
+
+        # If the cached block is freed, allocate it.
+        cached_block_id = cached_block.block_id
+        assert cached_block_id is not None
+        if cached_block_id in self.evictor:
+            self.evictor.remove(cached_block_id)
+        block.block_id = cached_block_id
 
         # Increment refcount of the cached block and (possibly) restore
         # it from the evictor.
@@ -460,6 +626,7 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
                 operation was performed, or the original block index if
                 no copy-on-write was necessary.
         """
+        raise NotImplementedError("Copy-on-write is not yet supported.")
         src_block_id = block.block_id
         assert src_block_id is not None
 
@@ -480,9 +647,11 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             List[Tuple[BlockId, BlockId]]: A list mapping source
                 block indices to destination block indices.
         """
+        raise NotImplementedError("Copy-on-write is not yet supported.")
         return self._cow_tracker.clear_cows()
 
-    def mark_blocks_as_accessed(self, block_ids: List[int], now: float) -> None:
+    def mark_blocks_as_accessed(self, block_ids: List[int],
+                                now: float) -> None:
         """Mark blocks as accessed, used in prefix caching.
 
         If the block is added into evictor, we need to update corresponding
@@ -495,7 +664,8 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             elif block_id in self.evictor:
                 self.evictor.update(block_id, now)
             else:
-                raise ValueError("Mark block as accessed which is not belonged to GPU")
+                raise ValueError(
+                    "Mark block as accessed which is not belonged to GPU")
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
         # Mark all touched blocks as computed.
@@ -503,7 +673,8 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             self._block_tracker[block_id].computed = True
         self._touched_blocks.clear()
 
-    def _track_block_id(self, block_id: Optional[BlockId], computed: bool) -> None:
+    def _track_block_id(self, block_id: Optional[BlockId],
+                        computed: bool) -> None:
         assert block_id is not None
         self._block_tracker[block_id].enable()
         self._block_tracker[block_id].computed = computed
@@ -541,8 +712,7 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         return ret
 
     def get_common_computed_block_ids(
-        self, computed_seq_block_ids: List[List[int]]
-    ) -> List[int]:
+            self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         """Return the block ids that are common for a given sequence group.
 
         Only those blocks that are immutable and already be marked
@@ -557,9 +727,9 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
         if len(computed_seq_block_ids) == 1:
             return computed_seq_block_ids[0]
 
-        return commonprefix(
-            [ids for ids in computed_seq_block_ids if ids]  # type: ignore
-        )
+        return commonprefix([ids for ids in computed_seq_block_ids
+                             if ids]  # type: ignore
+                            )
 
     def get_num_full_blocks_touched(self, blocks: List[Block]) -> int:
         """Returns the number of full blocks that will be touched by
@@ -577,54 +747,65 @@ class MTPrefixCachingBlockAllocator(PrefixCachingBlockAllocator):
             # If the block has a match in the cache and the cached
             # block is not referenced, then we still count it as a
             # touched block
-            if block.is_full and (
-                not self.is_block_cached(block)
-                or (
-                    block.content_hash is not None
-                    and self._cached_blocks[block.content_hash] in self.evictor
-                )
-            ):
+            assert block.content_hash is not None
+            cached_block = self._prefix_cache.get(block.content_hash)
+            if block.is_full and (cached_block is None or
+                                  (block.content_hash is not None and
+                                   ((cached_block.block_id is not None) and
+                                    (cached_block.block_id in self.evictor)))):
                 num_touched_blocks += 1
         return num_touched_blocks
 
     def swap_out(self, blocks: List[Block]) -> None:
-        """Execute the swap out actions. Basically just free the
-        given blocks.
-
-        Args:
-            blocks: List of blocks to be swapped out.
-        """
-        for block in blocks:
-            self._free_block_id(block)
+        raise NotImplementedError("Swap out is not supported.")
 
     def swap_in(self, blocks: List[Block]) -> None:
-        """Execute the swap in actions. Change the block id from
-        old allocator to current allocator for each block to finish
-        the block table update.
+        raise NotImplementedError("Swap in is not supported.")
 
-        Args:
-            blocks: List of blocks to be swapped in.
-        """
-        for block in blocks:
-            # Here we allocate either immutable or mutable block and then
-            # extract its block_id. Note that the block object is released
-            # and the block_id is assigned to "block" to allow reusing the
-            # existing "block" object
-            if block.is_full:
-                tmp_block = self.allocate_immutable_block(
-                    prev_block=block.prev_block, token_ids=block.token_ids
-                )
-            else:
-                tmp_block = self.allocate_mutable_block(prev_block=block.prev_block)
-                tmp_block.append_token_ids(block.token_ids)
+    def move_out(self, block: Block) -> None:
+        assert ((block.state == BlockState.FREED)
+                or (block.state == BlockState.EVICTED))
+        assert block.content_hash is not None
 
-            block_id = tmp_block.block_id
-            self._block_pool.free_block(tmp_block)
+        block_id = block.block_id
+        assert block_id is not None
 
-            block.block_id = block_id  # Assign block_id
+        logger.info(
+            "[noppanat] move_out block_id=%s, status=%s, refcount=%s",
+            block_id,
+            block.state,
+            self._refcounter.get(block_id),
+        )
+
+        if block_id in self.evictor:
+            # In case of moving out of lower-tier devices where all blocks are
+            # in the evictor.
+            self.evictor.remove(block_id)
+            self._hashless_allocator.free_block_id(block_id)
+
+        assert block.content_hash in self._prefix_cache
+
+        block.block_id = None
+        block.set_state(BlockState.EVICTED)
+
+    def move_in(self,
+                block: Block,
+                evictable: bool = False) -> MTAllocationOutput:
+        assert block.state == BlockState.EVICTED
+        assert block.content_hash is not None
+
+        alloc = self.allocate_immutable_block(prev_block=block.prev_block,
+                                              token_ids=block.token_ids)
+        block = alloc.block
+
+        if evictable:
+            self._decr_refcount_cached_block(block)
+            assert block.state == BlockState.FREED
+
+        return alloc
 
 
-class MTPrefixCachingBlock(PrefixCachingBlock):
+class MTPrefixCachingBlock(Block):
     """A block implementation that supports prefix caching.
 
     The MTPrefixCachingBlock class represents a block of token IDs with prefix
@@ -649,16 +830,14 @@ class MTPrefixCachingBlock(PrefixCachingBlock):
         prev_block: Optional[Block],
         token_ids: List[int],
         block_size: int,
-        allocator: BlockAllocator,
+        allocator: MTBlockAllocator,
         block_id: Optional[int] = None,
         computed: bool = False,
     ):
         assert isinstance(allocator, MTPrefixCachingBlockAllocator), (
             "Currently this class is only tested with "
             "MTPrefixCachingBlockAllocator. Got instead allocator = {}".format(
-                allocator
-            )
-        )
+                allocator))
         assert_prefix_caching_block_or_none(prev_block)
 
         self._prev_block = prev_block
@@ -797,7 +976,8 @@ class MTPrefixCachingBlock(PrefixCachingBlock):
 
         is_first_block = self._prev_block is None
         prev_block_hash = (
-            None if is_first_block else self._prev_block.content_hash  # type: ignore
+            None if is_first_block else
+            self._prev_block.content_hash  # type: ignore
         )
 
         # Previous block exists but does not yet have a hash.
@@ -806,8 +986,9 @@ class MTPrefixCachingBlock(PrefixCachingBlock):
             return None
 
         self._cached_content_hash = MTPrefixCachingBlock.hash_block_tokens(
-            is_first_block, prev_block_hash, cur_block_token_ids=self.token_ids
-        )
+            is_first_block,
+            prev_block_hash,
+            cur_block_token_ids=self.token_ids)
         return self._cached_content_hash
 
     @staticmethod
@@ -837,119 +1018,8 @@ class MTPrefixCachingBlock(PrefixCachingBlock):
         return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
 
 
-class ComputedBlocksTracker:
-    """Handles caching of per-sequence computed block ids.
-    When a sequence appears for the first time, it traverses all of the
-    blocks and detects the prefix of blocks that is computed. On the
-    subsequent times, it only traverses the new blocks that were added
-    and updates the already recorded prefix of blocks with the newly
-    computed blocks.
-
-    To avoid redundant traversals, the algorithm also detects when there
-    is a "gap" in the computed prefix. For example, if we have blocks =
-    [1,2,3,4,5], and we have detected [1,2,3] as the computed prefix, then
-    we won't try to add more computed blocks to [1,2,3] in this sequence
-    iteration, and will add more computed blocks only after the sequence is
-    freed and reused again.
-
-    Note that currently, for a given sequence, we also skip the last
-    block id for caching purposes, to avoid caching of a full sequence
-    """
-
-    def __init__(self, allocator):
-        self._allocator = allocator
-        self._cached_computed_seq_blocks: Dict[int, Tuple[List[int], bool]] = {}
-
-    def add_seq(self, seq_id: int) -> None:
-        """Start tracking seq_id"""
-        assert seq_id not in self._cached_computed_seq_blocks
-        self._cached_computed_seq_blocks[seq_id] = ([], False)
-
-    def remove_seq(self, seq_id: int) -> None:
-        """Stop tracking seq_id"""
-        assert seq_id in self._cached_computed_seq_blocks
-        del self._cached_computed_seq_blocks[seq_id]
-
-    def get_cached_computed_blocks_and_update(
-        self, seq_id: int, block_ids: List[int]
-    ) -> List[int]:
-        """Look at the class documentation for details"""
-        # Ensure seq_id is already tracked
-        assert seq_id in self._cached_computed_seq_blocks
-
-        # Get cached data (may be empty on the first time)
-        prev_computed_block_ids, has_gap = self._cached_computed_seq_blocks[seq_id]
-
-        if has_gap:
-            # When gap is detected, we do not add more computed blocks at this
-            # sequence iteration
-            return prev_computed_block_ids
-
-        # We do not consider the last block id for caching purposes.
-        num_cur_blocks = len(block_ids) - 1
-        assert num_cur_blocks >= 0
-
-        if len(prev_computed_block_ids) >= num_cur_blocks:
-            # Cache HIT
-            assert len(prev_computed_block_ids) == num_cur_blocks
-            return prev_computed_block_ids
-
-        # If here, then we may possibly add more computed blocks. As a result,
-        # traverse the additional blocks after prev_computed_block_ids to
-        # detect more computed blocks and add them.
-
-        # Incremental init for seq_id => Look only at the new blocks
-        computed_block_ids = self._allocator.get_computed_block_ids(  # noqa: E501
-            prev_computed_block_ids,
-            block_ids,
-            skip_last_block_id=True,  # We skip last block id to avoid caching of full seq
-        )
-
-        # Detect if there is a "gap"
-        has_gap = len(computed_block_ids) < num_cur_blocks
-
-        # Record
-        self._cached_computed_seq_blocks[seq_id] = (computed_block_ids, has_gap)
-
-        return computed_block_ids
-
-
-class LastAccessBlocksTracker:
-    """Manages the last access time of the tracked sequences, in order to allow
-    an efficient update of allocator's block last access times
-    """
-
-    def __init__(self, allocator):
-        self._allocator = allocator
-        self._seq_last_access: Dict[int, Optional[float]] = {}
-
-    def add_seq(self, seq_id: int) -> None:
-        """Start tracking seq_id"""
-        assert seq_id not in self._seq_last_access
-        self._seq_last_access[seq_id] = None
-
-    def remove_seq(self, seq_id: int) -> None:
-        """Stop tracking seq_id"""
-        assert seq_id in self._seq_last_access
-        del self._seq_last_access[seq_id]
-
-    def update_last_access(self, seq_id: int, time: float) -> None:
-        assert seq_id in self._seq_last_access
-        self._seq_last_access[seq_id] = time
-
-    def update_seq_blocks_last_access(self, seq_id: int, block_ids: List[int]) -> None:
-        assert seq_id in self._seq_last_access
-
-        ts = self._seq_last_access[seq_id]
-
-        if ts is None:
-            # No last access was recorded, no need to update.
-            return
-
-        self._allocator.mark_blocks_as_accessed(block_ids, ts)
-
-
 def assert_prefix_caching_block_or_none(block: Optional[Block]):
     if block is None:
         return
-    assert isinstance(block, MTPrefixCachingBlock), "Got block = {}".format(block)
+    assert isinstance(block,
+                      MTPrefixCachingBlock), "Got block = {}".format(block)

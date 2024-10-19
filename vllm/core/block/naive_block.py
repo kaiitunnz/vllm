@@ -1,9 +1,11 @@
 from collections import deque
 from typing import Deque, FrozenSet, Iterable, List, Optional, Tuple
 
-from vllm.core.block.common import (BlockPool, CopyOnWriteTracker, RefCounter,
+from vllm.core.block.common import (AllocationOutputPool, BlockPool,
+                                    CopyOnWriteTracker, RefCounter,
                                     get_all_blocks_recursively)
-from vllm.core.block.interfaces import Block, BlockAllocator, BlockId, Device
+from vllm.core.block.interfaces import (AllocationOutput, Block,
+                                        BlockAllocator, BlockId, Device)
 
 Refcount = int
 
@@ -52,18 +54,20 @@ class NaiveBlockAllocator(BlockAllocator):
             # Pre-allocate "num_blocks * extra_factor" block objects.
             # The "* extra_factor" is a buffer to allow more block objects
             # than physical blocks
-            self._block_pool = BlockPool(self._block_size, create_block, self,
-                                         num_blocks * extra_factor)
+            self._alloc_pool = AllocationOutputPool.create(
+                self._block_size, create_block, self,
+                num_blocks * extra_factor)
         else:
             # In this case, the block pool is provided by the caller,
             # which means that there is most likely a need to share
             # a block pool between allocators
-            self._block_pool = block_pool
+            self._alloc_pool = AllocationOutputPool(block_pool)
 
-    def allocate_immutable_block(self,
-                                 prev_block: Optional[Block],
-                                 token_ids: List[int],
-                                 device: Optional[Device] = None) -> Block:
+    def allocate_immutable_block(
+            self,
+            prev_block: Optional[Block],
+            token_ids: List[int],
+            device: Optional[Device] = None) -> AllocationOutput:
         """Allocates a new immutable block with the given token IDs, linked to
         the previous block.
 
@@ -77,15 +81,15 @@ class NaiveBlockAllocator(BlockAllocator):
             Block: The newly allocated immutable block.
         """
         assert device is None
-        block = self.allocate_mutable_block(prev_block=prev_block)
-        block.append_token_ids(token_ids)
-        return block
+        alloc = self.allocate_mutable_block(prev_block=prev_block)
+        alloc.block.append_token_ids(token_ids)
+        return alloc
 
     def allocate_immutable_blocks(
             self,
             prev_block: Optional[Block],
             block_token_ids: List[List[int]],
-            device: Optional[Device] = None) -> List[Block]:
+            device: Optional[Device] = None) -> List[AllocationOutput]:
         assert device is None
         num_blocks = len(block_token_ids)
 
@@ -93,20 +97,22 @@ class NaiveBlockAllocator(BlockAllocator):
         for i in range(num_blocks):
             block_ids.append(self._allocate_block_id())
 
-        blocks = []
+        alloc_outputs = []
         for i in range(num_blocks):
-            prev_block = self._block_pool.init_block(
+            prev_alloc = self._alloc_pool.init_alloc_output(
                 prev_block=prev_block,
                 token_ids=block_token_ids[i],
                 block_size=self._block_size,
-                physical_block_id=block_ids[i])
-            blocks.append(prev_block)
+                physical_block_id=block_ids[i],
+            )
+            alloc_outputs.append(prev_alloc)
 
-        return blocks
+        return alloc_outputs
 
-    def allocate_mutable_block(self,
-                               prev_block: Optional[Block],
-                               device: Optional[Device] = None) -> Block:
+    def allocate_mutable_block(
+            self,
+            prev_block: Optional[Block],
+            device: Optional[Device] = None) -> AllocationOutput:
         """Allocates a new mutable block, linked to the previous block.
 
         Args:
@@ -119,11 +125,11 @@ class NaiveBlockAllocator(BlockAllocator):
         """
         assert device is None
         block_id = self._allocate_block_id()
-        block = self._block_pool.init_block(prev_block=prev_block,
-                                            token_ids=[],
-                                            block_size=self._block_size,
-                                            physical_block_id=block_id)
-        return block
+        alloc = self._alloc_pool.init_alloc_output(prev_block=prev_block,
+                                                   token_ids=[],
+                                                   block_size=self._block_size,
+                                                   physical_block_id=block_id)
+        return alloc
 
     def _allocate_block_id(self) -> BlockId:
         if not self._free_block_indices:
@@ -149,9 +155,14 @@ class NaiveBlockAllocator(BlockAllocator):
 
         # Release the block object
         if not keep_block_object:
-            self._block_pool.free_block(block)
+            self._alloc_pool.free_block(block)
 
-    def fork(self, last_block: Block) -> List[Block]:
+    def free_block_id(self, block_id: BlockId) -> None:
+        assert self._refcounter.get(block_id) == 0
+        assert block_id not in self._free_block_indices
+        self._free_block_indices.appendleft(block_id)
+
+    def fork(self, last_block: Block) -> List[AllocationOutput]:
         """Creates a new sequence of blocks that shares the same underlying
         memory as the original sequence.
 
@@ -164,7 +175,7 @@ class NaiveBlockAllocator(BlockAllocator):
         """
         source_blocks = get_all_blocks_recursively(last_block)
 
-        forked_blocks: List[Block] = []
+        forked_allocs: List[AllocationOutput] = []
         prev_block = None
         for block in source_blocks:
 
@@ -173,16 +184,16 @@ class NaiveBlockAllocator(BlockAllocator):
             refcount = self._refcounter.incr(block.block_id)
             assert refcount != 1, "can't fork free'd block"
 
-            forked_block = self._block_pool.init_block(
+            forked_alloc = self._alloc_pool.init_alloc_output(
                 prev_block=prev_block,
                 token_ids=block.token_ids,
                 block_size=self._block_size,
                 physical_block_id=block.block_id)
 
-            forked_blocks.append(forked_block)
-            prev_block = forked_blocks[-1]
+            forked_allocs.append(forked_alloc)
+            prev_block = forked_allocs[-1]
 
-        return forked_blocks
+        return forked_allocs
 
     def get_num_free_blocks(self) -> int:
         return len(self._free_block_indices)
@@ -313,16 +324,16 @@ class NaiveBlockAllocator(BlockAllocator):
             # and the block_id is assigned to "block" to allow reusing the
             # existing "block" object
             if block.is_full:
-                tmp_block = self.allocate_immutable_block(
+                tmp_alloc = self.allocate_immutable_block(
                     prev_block=block.prev_block, token_ids=block.token_ids)
             else:
-                tmp_block = self.allocate_mutable_block(
+                tmp_alloc = self.allocate_mutable_block(
                     prev_block=block.prev_block)
-                tmp_block.append_token_ids(block.token_ids)
+                tmp_alloc.block.append_token_ids(block.token_ids)
 
-            block_id = tmp_block.block_id
-            tmp_block.block_id = None
-            self._block_pool.free_block(tmp_block)
+            block_id = tmp_alloc.block.block_id
+            tmp_alloc.block.block_id = None
+            self._alloc_pool.free_alloc_output(tmp_alloc)
 
             block.block_id = block_id  # Assign block_id
 
