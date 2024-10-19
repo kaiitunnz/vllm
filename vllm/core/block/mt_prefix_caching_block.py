@@ -626,7 +626,10 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
                 operation was performed, or the original block index if
                 no copy-on-write was necessary.
         """
-        raise NotImplementedError("Copy-on-write is not yet supported.")
+        # NOTE(noppanat): Copy-on-write is not yet supported.
+        block_id = block.block_id
+        assert block_id is not None
+        return block_id
         src_block_id = block.block_id
         assert src_block_id is not None
 
@@ -647,7 +650,6 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             List[Tuple[BlockId, BlockId]]: A list mapping source
                 block indices to destination block indices.
         """
-        raise NotImplementedError("Copy-on-write is not yet supported.")
         return self._cow_tracker.clear_cows()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
