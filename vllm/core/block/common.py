@@ -286,11 +286,9 @@ class AllocationOutputPool:
 
     def increase_pool(self):
         """Increases pool to match the block pool size"""
-        cur_pool_size = self._block_pool._pool_size
-        self._alloc_pool.extend([
-            AllocationOutput(block)
-            for block in self._block_pool._pool[cur_pool_size:]
-        ])
+        cur_pool_size = len(self._alloc_pool)
+        self._alloc_pool.extend(
+            self._create_alloc_pool(self._block_pool._pool[cur_pool_size:]))
 
     def init_block(
         self,
@@ -381,11 +379,9 @@ class MTAllocationOutputPool:
 
     def increase_pool(self):
         """Increases pool to match the block pool size"""
-        cur_pool_size = self._block_pool._pool_size
-        self._alloc_pool.extend([
-            MTAllocationOutput(block)
-            for block in self._block_pool._pool[cur_pool_size:]
-        ])
+        cur_pool_size = len(self._alloc_pool)
+        self._alloc_pool.extend(
+            self._create_alloc_pool(self._block_pool._pool[cur_pool_size:]))
 
     def init_block(
         self,
