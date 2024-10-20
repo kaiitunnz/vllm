@@ -2,7 +2,7 @@
 from os.path import commonprefix
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
-from vllm.core.block.common import (AllocationOutputPool, CacheMetricData,
+from vllm.core.block.common import (BlockPool, CacheMetricData,
                                     CopyOnWriteTracker,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import (AllocationOutput, Block,
@@ -87,9 +87,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # The "* extra_factor" is a buffer to allow more block objects
         # than physical blocks
         extra_factor = 4
-        self._alloc_pool = AllocationOutputPool.create(
-            self._block_size, self._create_block, self,
-            num_blocks * extra_factor)
+        self._block_pool = BlockPool(self._block_size, self._create_block,
+                                     self, num_blocks * extra_factor)
 
         # An allocator for blocks that do not have prefix hashes.
         self._hashless_allocator = NaiveBlockAllocator(
@@ -97,7 +96,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             num_blocks=num_blocks,
             block_size=block_size,
             block_ids=block_ids,
-            block_pool=self._alloc_pool.block_pool,  # Share block pool here
+            block_pool=self._block_pool,  # Share block pool here
         )
 
         # Evitor used to maintain how we want to handle those computed blocks
@@ -155,21 +154,21 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert_prefix_caching_block_or_none(prev_block)
 
         # First, try to create a block that points to cached data
-        alloc = self._alloc_pool.init_alloc_output(prev_block=prev_block,
-                                                   token_ids=token_ids,
-                                                   block_size=self._block_size,
-                                                   physical_block_id=None)
-        assert alloc.block.content_hash is not None
+        block = self._block_pool.init_block(prev_block=prev_block,
+                                            token_ids=token_ids,
+                                            block_size=self._block_size,
+                                            physical_block_id=None)
+        assert block.content_hash is not None
 
-        cached_block_id = self._cached_blocks.get(alloc.block.content_hash,
-                                                  None)
+        cached_block_id = self._cached_blocks.get(block.content_hash, None)
         if cached_block_id is not None:
             self.metric_data.query(hit=True)
-            alloc.block.block_id = cached_block_id
-            self._incr_refcount_cached_block(alloc.block)
+            block.block_id = cached_block_id
+            self._incr_refcount_cached_block(block)
+            alloc = AllocationOutput(block)
             return alloc
         self.metric_data.query(hit=False)
-        self._alloc_pool.free_alloc_output(alloc)
+        self._block_pool.free_block(block)
 
         # No cached block => Allocate a new block
         alloc = self.allocate_mutable_block(prev_block)
@@ -208,12 +207,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert_prefix_caching_block_or_none(prev_block)
 
         block_id = self._allocate_block_id()
-        alloc = self._alloc_pool.init_alloc_output(prev_block=prev_block,
-                                                   token_ids=[],
-                                                   block_size=self._block_size,
-                                                   physical_block_id=block_id)
-        assert not alloc.block.computed
-        assert alloc.block.content_hash is None
+        block = self._block_pool.init_block(prev_block=prev_block,
+                                            token_ids=[],
+                                            block_size=self._block_size,
+                                            physical_block_id=block_id)
+        assert not block.computed
+        assert block.content_hash is None
+        alloc = AllocationOutput(block)
         return alloc
 
     def _incr_refcount_cached_block(self, block: Block) -> None:
@@ -294,7 +294,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             alloc = self._hashless_allocator.allocate_mutable_block(
                 prev_block=None)
             block_id = alloc.block.block_id
-            self._alloc_pool.free_alloc_output(alloc)
+            self._block_pool.free_block(alloc.block)
 
             self._track_block_id(block_id, computed=False)
             return block_id
@@ -354,7 +354,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
         # Release the block object to the pool
         if not keep_block_object:
-            self._alloc_pool.free_block(block)
+            self._block_pool.free_block(block)
 
     def free_block_id(self, block_id: BlockId) -> None:
         raise NotImplementedError()
@@ -382,12 +382,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             assert refcount != 1, "can't fork free'd block_id = {}".format(
                 block_id)
 
-            forked_alloc = self._alloc_pool.init_alloc_output(
+            forked_block = self._block_pool.init_block(
                 prev_block=prev_block,
                 token_ids=block.token_ids,
                 block_size=self._block_size,
                 physical_block_id=block_id)
 
+            forked_alloc = AllocationOutput(forked_block)
             forked_allocs.append(forked_alloc)
             prev_block = forked_allocs[-1].block
 
@@ -639,7 +640,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                 tmp_alloc.block.append_token_ids(block.token_ids)
 
             block_id = tmp_alloc.block.block_id
-            self._alloc_pool.free_alloc_output(tmp_alloc)
+            self._block_pool.free_block(tmp_alloc.block)
 
             block.block_id = block_id  # Assign block_id
 

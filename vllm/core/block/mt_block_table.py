@@ -199,8 +199,8 @@ class MTBlockTable:
             assert len(self._blocks) > 0
             alloc = self._allocator.allocate_mutable_block(
                 prev_block=self._blocks[-1], device=device)
-            if alloc.evicted_block:
-                self._allocator.destroy(alloc.evicted_block)
+            if alloc.evicted_meta:
+                self._allocator.destroy(alloc.evicted_meta.block)
             self._blocks.append(alloc.block)
 
     def fork(self) -> "MTBlockTable":
@@ -289,11 +289,12 @@ class MTBlockTable:
         # Highest-tier device
         for block in cached_blocks:
             alloc = self._allocator.allocate_cached_block(block)
-            assert alloc.evicted_block is None
+            assert alloc.evicted_meta is None
         blocks.extend(cached_blocks)
 
         # Lower-tier devices
-        self._allocator.move_in(cached_blocks_to_move_in)
+        self._allocator.move_in(cached_blocks_to_move_in,
+                                block_ids_in_use=block_ids_in_use)
         blocks.extend(cached_blocks_to_move_in)
 
         blocks_to_move_out = []
@@ -307,8 +308,8 @@ class MTBlockTable:
                 block_ids_in_use=block_ids_in_use,
             )
             for alloc in alloc_outputs:
-                if alloc.evicted_block is not None:
-                    blocks_to_move_out.append(alloc.evicted_block)
+                if alloc.evicted_meta is not None:
+                    blocks_to_move_out.append(alloc.evicted_meta)
                 blocks.append(alloc.block)
             prev_block = blocks[-1]
 
@@ -319,12 +320,13 @@ class MTBlockTable:
                 device=device,
                 block_ids_in_use=block_ids_in_use)
             alloc.block.append_token_ids(tail_block_token_ids)
-            if alloc.evicted_block is not None:
-                blocks_to_move_out.append(alloc.evicted_block)
+            if alloc.evicted_meta is not None:
+                blocks_to_move_out.append(alloc.evicted_meta)
             blocks.append(alloc.block)
 
         # Perform hierarchical eviction
-        self._allocator.move_out(blocks_to_move_out)
+        self._allocator.move_out(blocks_to_move_out,
+                                 block_ids_in_use=block_ids_in_use)
 
         return blocks
 

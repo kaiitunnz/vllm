@@ -137,7 +137,8 @@ class SchedulerOutputs:
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
-        assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
+        # NOTE(noppanat): This is not true for multi-tier KV cache
+        # assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
 
         self.num_loras: int = len(self.lora_requests)
         if self.num_loras > 0:
@@ -1039,6 +1040,7 @@ class Scheduler:
         num_allocated_blocks = 0
         # List of (num_lookahead_slots, num_new_tokens, num_new_seqs)
         seq_group_meta_list: List[Tuple[int, int, int]] = []
+        allocated_evicted_blocks: List[int] = []
         while waiting_queue:
             if not self._passed_delay(time.time()):
                 logger.info("[noppanat]: timed out")
@@ -1109,6 +1111,7 @@ class Scheduler:
                 seq_metas=seq_metas,
                 num_allocated_blocks=num_allocated_blocks,
                 num_lookahead_slots=num_lookahead_slots,
+                allocated_evicted_blocks=allocated_evicted_blocks,
             )
             if can_allocate == AllocStatus.LATER:
                 break

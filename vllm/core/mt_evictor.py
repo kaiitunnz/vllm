@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Optional, OrderedDict, Set
 
-from vllm.core.block.interfaces import Block, BlockState
+from vllm.core.block.interfaces import Block, BlockState, EvictedBlockMetaData
 from vllm.core.evictor_v2 import EvictionPolicy
 from vllm.utils import init_logger
 
@@ -26,13 +26,15 @@ class MTEvictor(ABC):
         pass
 
     @abstractmethod
-    def evict(self, blocks_in_use: Optional[Set[int]] = None) -> Block:
+    def evict(
+            self,
+            blocks_in_use: Optional[Set[int]] = None) -> EvictedBlockMetaData:
         """Runs the eviction algorithm and returns the evicted block
         """
         pass
 
     @abstractmethod
-    def add(self, block: Block, last_accessed: float):
+    def add(self, block: Block, last_accessed: float, hit_count: int):
         """Adds block to the evictor, making it a candidate for eviction"""
         pass
 
@@ -52,23 +54,6 @@ class MTEvictor(ABC):
         pass
 
 
-class MTBlockMetaData:
-    """Data structure for storing key data describe cached block, so that
-    evitor could use to make its decision which one to choose for eviction
-
-    Here we use physical block id as the dict key, as there maybe several
-    blocks with the same content hash, but their physical id is unique.
-    """
-
-    def __init__(self, block: Block, last_accessed: float):
-        self.block = block
-        self.last_accessed = last_accessed
-
-    @property
-    def num_hashed_tokens(self) -> int:
-        return self.block.num_tokens_total
-
-
 class LRUMTEvictor(MTEvictor):
     """Evicts in a least-recently-used order using the last_accessed timestamp
     that's recorded in the PhysicalTokenBlock. If there are multiple blocks with
@@ -78,12 +63,15 @@ class LRUMTEvictor(MTEvictor):
     """
 
     def __init__(self):
-        self.free_table: OrderedDict[int, MTBlockMetaData] = OrderedDict()
+        self.free_table: OrderedDict[int, EvictedBlockMetaData] = OrderedDict()
 
     def __contains__(self, block_id: int) -> bool:
         return block_id in self.free_table
 
-    def evict(self, block_ids_in_use: Optional[Set[int]] = None) -> Block:
+    def evict(
+            self,
+            block_ids_in_use: Optional[Set[int]] = None
+    ) -> EvictedBlockMetaData:
         logger.info("[noppanat] block_ids_in_use=%s", block_ids_in_use)
         logger.info("[noppanat] free_table=%s", self.free_table)
         if len(self.free_table) == 0:
@@ -114,13 +102,14 @@ class LRUMTEvictor(MTEvictor):
         evicted_block.block_id = evicted_id
         assert evicted_block.state == BlockState.FREED
         evicted_block.set_state(BlockState.EVICTED)
-        return evicted_block
+        return evicted_meta
 
-    def add(self, block: Block, last_accessed: float):
+    def add(self, block: Block, last_accessed: float, hit_count: int):
         assert block.state == BlockState.ALLOCATED
         assert block.block_id is not None
         block.set_state(BlockState.FREED)
-        self.free_table[block.block_id] = MTBlockMetaData(block, last_accessed)
+        self.free_table[block.block_id] = EvictedBlockMetaData(
+            block, last_accessed, hit_count)
 
     def update(self, block_id: int, last_accessed: float):
         self.free_table[block_id].last_accessed = last_accessed

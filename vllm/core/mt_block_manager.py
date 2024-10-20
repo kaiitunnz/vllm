@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Set, Tuple
 
-from vllm.core.block.interfaces import Block
+from vllm.core.block.interfaces import Block, BlockState
 from vllm.core.block.mt_block_allocator import MTPrefixAwareBlockAllocator
 from vllm.core.block.mt_block_table import MTBlockTable
 from vllm.core.block.mt_interfaces import MTDeviceAwareBlockAllocator
@@ -75,13 +75,34 @@ class SequenceMeta:
             is not None), "Number of required blocks has not been computed."
         return self._num_required_blocks
 
-    def get_num_required_blocks(self, block_size: int,
-                                num_lookahead_slots: int) -> int:
-        if self._num_required_blocks is not None:
+    def get_num_required_blocks(
+            self,
+            block_size: int,
+            num_lookahead_slots: int,
+            allocated_evicted_blocks: Optional[List[int]] = None) -> int:
+        if (allocated_evicted_blocks is None
+                and self._num_required_blocks is not None):
             return self._num_required_blocks
+
+        cached_blocks_to_allocate: List[int] = []
+        if allocated_evicted_blocks is None:
+            for block in self._cached_blocks:
+                assert block.block_id is not None
+                if block.state == BlockState.FREED:
+                    cached_blocks_to_allocate.append(block.block_id)
+        else:
+            for block in self._cached_blocks:
+                assert block.block_id is not None
+                if ((block.state == BlockState.FREED)
+                        and (block.block_id not in allocated_evicted_blocks)):
+                    cached_blocks_to_allocate.append(block.block_id)
+            allocated_evicted_blocks.extend(cached_blocks_to_allocate)
+
         num_tail_blocks = cdiv(
             len(self._tail_block_token_ids) + num_lookahead_slots, block_size)
-        self._num_required_blocks = (len(self.cached_blocks_to_move_in) +
+
+        self._num_required_blocks = (len(cached_blocks_to_allocate) +
+                                     len(self.cached_blocks_to_move_in) +
                                      len(self.full_block_token_ids) +
                                      num_tail_blocks)
         return self._num_required_blocks
@@ -265,18 +286,28 @@ class MTBlockSpaceManager:
             for seq_meta in seq_metas for block_id in seq_meta.block_ids_in_use
         }
 
-    def can_allocate(self,
-                     seq_group: SequenceGroup,
-                     seq_metas: List[SequenceMeta],
-                     num_allocated_blocks: int = 0,
-                     num_lookahead_slots: int = 0) -> AllocStatus:
+    def can_allocate(
+            self,
+            seq_group: SequenceGroup,
+            seq_metas: List[SequenceMeta],
+            num_allocated_blocks: int = 0,
+            num_lookahead_slots: int = 0,
+            allocated_evicted_blocks: Optional[List[int]] = None
+    ) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
 
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
+        # NOTE(noppanat): This is necessary for determining the number of
+        # required blocks.
+        assert allocated_evicted_blocks is not None
+
         num_required_blocks = self.get_num_required_blocks(
-            seq_group, seq_metas[0], num_lookahead_slots=num_lookahead_slots)
+            seq_group,
+            seq_metas[0],
+            num_lookahead_slots=num_lookahead_slots,
+            allocated_evicted_blocks=allocated_evicted_blocks)
 
         num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
             device=Device.GPU)
@@ -298,9 +329,10 @@ class MTBlockSpaceManager:
         seq_group: SequenceGroup,
         seq_meta: SequenceMeta,
         num_lookahead_slots: int = 0,
+        allocated_evicted_blocks: Optional[List[int]] = None,
     ) -> int:
         num_required_blocks = seq_meta.get_num_required_blocks(
-            self.block_size, num_lookahead_slots)
+            self.block_size, num_lookahead_slots, allocated_evicted_blocks)
 
         if seq_group.is_encoder_decoder():
             raise NotImplementedError("Cross-attention is not yet supported.")

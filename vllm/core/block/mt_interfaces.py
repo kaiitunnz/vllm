@@ -1,19 +1,22 @@
 from abc import abstractmethod
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from vllm.core.block.interfaces import (AllocationOutput, Block,
                                         BlockAllocator, BlockState,
-                                        DeviceAwareBlockAllocator)
+                                        DeviceAwareBlockAllocator,
+                                        EvictedBlockMetaData)
 from vllm.utils import Device
 
 
-@dataclass
 class MTAllocationOutput(AllocationOutput):
 
-    def __post_init__(self):
-        assert (self.evicted_block is None
-                or self.evicted_block.state == BlockState.EVICTED)
+    def __init__(self,
+                 block: "Block",
+                 evicted_meta: Optional[EvictedBlockMetaData] = None):
+        super().__init__(block, evicted_meta)
+
+        assert (self.evicted_meta is None
+                or self.evicted_meta.block.state == BlockState.EVICTED)
 
 
 class MTBlockAllocator(BlockAllocator):
@@ -64,13 +67,16 @@ class MTBlockAllocator(BlockAllocator):
         pass
 
     @abstractmethod
-    def move_in(self,
-                block: Block,
-                evictable: bool = False) -> MTAllocationOutput:
+    def move_in(
+            self,
+            block: Block,
+            hit_count: int = 0,
+            evictable: bool = False,
+            block_ids_in_use: Optional[Set[int]] = None) -> MTAllocationOutput:
         pass
 
     @abstractmethod
-    def destroy(self, block: Block) -> None:
+    def destroy(self, block: Block, keep_prefix_cache: bool = False) -> None:
         pass
 
 
@@ -114,11 +120,15 @@ class MTDeviceAwareBlockAllocator(DeviceAwareBlockAllocator):
         pass
 
     @abstractmethod
-    def move_in(self, blocks: List[Block]) -> None:
+    def move_in(self,
+                blocks: List[Block],
+                block_ids_in_use: Optional[Set[int]] = None) -> None:
         pass
 
     @abstractmethod
-    def move_out(self, blocks: List[Block]) -> None:
+    def move_out(self,
+                 blocks: List[EvictedBlockMetaData],
+                 block_ids_in_use: Optional[Set[int]] = None) -> None:
         pass
 
     @abstractmethod

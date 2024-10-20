@@ -1,6 +1,5 @@
 import enum
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional, Protocol, Sequence, Tuple
 
 from vllm.utils import Device
@@ -16,15 +15,33 @@ class BlockState(enum.Enum):
     FREED = enum.auto()
 
 
-@dataclass
-class AllocationOutput:
-    block: "Block"
-    """Allocated block"""
-    evicted_block: Optional["Block"] = None
-    """Evicted block"""
+class EvictedBlockMetaData:
+    """Data structure for storing key data describe evicted block, that the 
+    evictor uses to decide which block to evict.
+    """
+    __slots__ = ("block", "last_accessed", "hit_count")
 
-    def __post_init__(self):
-        assert self.evicted_block is None
+    def __init__(self,
+                 block: "Block",
+                 last_accessed: float,
+                 hit_count: int = 0):
+        self.block = block
+        self.last_accessed = last_accessed
+        self.hit_count = hit_count
+
+    @property
+    def num_hashed_tokens(self) -> int:
+        return self.block.num_tokens_total
+
+
+class AllocationOutput:
+    __slots__ = ("block", "evicted_meta")
+
+    def __init__(self,
+                 block: "Block",
+                 evicted_meta: Optional[EvictedBlockMetaData] = None):
+        self.block = block
+        self.evicted_meta = evicted_meta
 
 
 class Block(ABC):
