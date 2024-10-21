@@ -1043,7 +1043,6 @@ class Scheduler:
         allocated_evicted_blocks: List[int] = []
         while waiting_queue:
             if not self._passed_delay(time.time()):
-                logger.info("[noppanat]: timed out")
                 break
 
             seq_group = waiting_queue[0]
@@ -1097,13 +1096,6 @@ class Scheduler:
             # TODO(noppanat): Check the interface.
             seq_metas = self.block_manager.process_sequence_group(
                 seq_group, status=SequenceStatus.WAITING)
-            logger.info(
-                "[noppanat]: seq_metas: %s, %s, %s, %s",
-                [block.block_id for block in seq_metas[0].cached_blocks],
-                seq_metas[0].cached_blocks_to_move_in,
-                seq_metas[0].full_block_token_ids,
-                seq_metas[0].tail_block_token_ids,
-            )
             assert len(seq_metas) == 1
             # If the sequence group cannot be allocated, stop.
             can_allocate = self.block_manager.can_allocate(
@@ -1144,9 +1136,6 @@ class Scheduler:
             seq_meta for seq_metas in seq_metas_to_allocate
             for seq_meta in seq_metas
         ])
-
-        logger.info("[noppanat]: seq_groups_to_allocate %s",
-                    seq_groups_to_allocate)
 
         for seq_group, seq_metas, seq_group_meta in zip(
                 seq_groups_to_allocate, seq_metas_to_allocate,
@@ -1413,7 +1402,6 @@ class Scheduler:
 
     def _schedule(self) -> SchedulerOutputs:
         """Schedule queued requests."""
-        logger.info("[noppanat]: begin scheduling")
         if self.scheduler_config.chunked_prefill_enabled:
             return self._schedule_chunked_prefill()
         else:
@@ -1599,22 +1587,9 @@ class Scheduler:
         self.cache_id = self.next_cache_id
 
         # TODO(noppanat): remove this
-        self.block_manager.print_content()
-        logger.info("[noppanat]: blocks_to_swap_in=%s, blocks_to_swap_out=%s",
-                    scheduler_outputs.blocks_to_swap_in,
-                    scheduler_outputs.blocks_to_swap_out)
+        # self.block_manager.print_content()
         for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
             seq = scheduled_seq_group.seq_group.get_seqs()[0]
-            logger.info(("[noppanat] "
-                         "prompt_token_ids: %s, "
-                         "token_ids: %s, "
-                         "len: %s, "
-                         "num_computed_tokens: %s, "
-                         "num_uncomputed_tokens: %s"),
-                        seq.data.get_prompt_token_ids(),
-                        seq.data.get_token_ids(), seq.data.get_len(),
-                        seq.data.get_num_computed_tokens(),
-                        seq.data.get_num_uncomputed_tokens())
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,

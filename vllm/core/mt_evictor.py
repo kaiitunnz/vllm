@@ -72,8 +72,6 @@ class LRUMTEvictor(MTEvictor):
             self,
             block_ids_in_use: Optional[Set[int]] = None
     ) -> EvictedBlockMetaData:
-        logger.info("[noppanat] block_ids_in_use=%s", block_ids_in_use)
-        logger.info("[noppanat] free_table=%s", self.free_table)
         if len(self.free_table) == 0:
             raise MTEvictionError("No usable cache memory left")
 

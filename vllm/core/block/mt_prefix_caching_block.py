@@ -500,12 +500,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         allocator free(..) with keep_block_object=True is called to only free
         the block id (since the block object may be reused by the caller)
         """
-        assert block.state == BlockState.ALLOCATED, "[noppanat] "
-        f"block.trace={block._trace}, "
-        f"block_id={block.block_id}, "
-        f"computed={block.computed}, "
-        f"content_hash={block.content_hash}, "
-        f"last_accessed={block.last_accessed}"
+        assert block.state == BlockState.ALLOCATED
         block_id = block.block_id
         assert block_id is not None, "Freeing unallocated block is undefined"
 

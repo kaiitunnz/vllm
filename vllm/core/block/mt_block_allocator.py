@@ -29,9 +29,7 @@ class BlockMover:
             original_src = src_record.pop(src, BlockMover.PLACEHOLDER)
             self._record[dst] = (src if original_src is BlockMover.PLACEHOLDER
                                  else original_src)
-            assert dst[0] != self._record[dst], (
-                f"[noppanat] src={src}, dst={dst}, original_src={original_src}"
-            )
+            assert dst[0] != self._record[dst][0]
         else:
             self._record.pop(src, None)
             self._pending.pop(src, None)
@@ -275,12 +273,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
         if isinstance(block, NullBlock):
             return
         block_id = block.block_id
-        assert block_id is not None, (
-            f"[noppanat] block.trace={block._trace}, "
-            f"block_id={block.block_id}, "
-            f"computed={block.computed}, "
-            f"content_hash={block.content_hash}, "
-            f"last_accessed={block.last_accessed}")
+        assert block_id is not None
         allocator = self._block_ids_to_allocator[block_id]
         allocator.free(block)
 
