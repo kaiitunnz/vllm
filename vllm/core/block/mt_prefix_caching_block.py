@@ -11,9 +11,6 @@ from vllm.core.block.mt_interfaces import MTAllocationOutput, MTBlockAllocator
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixHash
 from vllm.core.mt_evictor import EvictionPolicy, MTEvictor, make_mt_evictor
-from vllm.utils import init_logger
-
-logger = init_logger(__name__)
 
 _DEFAULT_LAST_ACCESSED_TIME = -1
 
@@ -209,8 +206,13 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         device: Optional[Device] = None,
         block_ids_in_use: Optional[Set[BlockId]] = None,
     ) -> MTAllocationOutput:
-        """Allocates an immutable block with the given token IDs, reusing cached
-        blocks if possible.
+        """Allocates an immutable block with the given token IDs
+
+        Avoid calling this function if you know there is a previously cached 
+        block. Instead, use `allocate_cached_block`. In general, you should use 
+        `allocate_placeholder_block` and process the block to determine whether 
+        it is cached or not and use `promote_placeholder_block` to promote it 
+        to an immutable block.
 
         Args:
             prev_block (Optional[Block]): The previous block in the sequence.
@@ -222,58 +224,6 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         assert device is None
         assert_prefix_caching_block_or_none(prev_block)
 
-        # Check if the block is already cached
-        if prev_block is None:
-            content_hash = MTPrefixCachingBlock.hash_block_tokens(
-                is_first_block=True,
-                prev_block_hash=None,
-                cur_block_token_ids=token_ids)
-        else:
-            content_hash = MTPrefixCachingBlock.hash_block_tokens(
-                is_first_block=False,
-                prev_block_hash=prev_block.content_hash,
-                cur_block_token_ids=token_ids,
-            )
-        cached_block = self._prefix_cache.get(content_hash)
-        if cached_block is not None:
-            return self.allocate_cached_block(cached_block)
-
-        # # Check if the block is already cached
-        # # TODO(noppanat): remove this for performance.
-        # if prev_block is None:
-        #     content_hash = MTPrefixCachingBlock.hash_block_tokens(
-        #         is_first_block=True,
-        #         prev_block_hash=None,
-        #         cur_block_token_ids=token_ids
-        #     )
-        # else:
-        #     content_hash = MTPrefixCachingBlock.hash_block_tokens(
-        #         is_first_block=False,
-        #         prev_block_hash=prev_block.content_hash,
-        #         cur_block_token_ids=token_ids,
-        #     )
-        # # NOTE(noppanat): Avoiding hash computation for performance.
-        # assert (
-        #     self._prefix_cache.get(content_hash) is None
-        # ), "Block is already cached. Use allocate_cached_block instead."
-
-        # # First, try to create a block that points to cached data
-        # block = self._alloc_pool.init_block(
-        #     prev_block=prev_block,
-        #     token_ids=token_ids,
-        #     block_size=self._block_size,
-        #     physical_block_id=None,
-        # )
-        # assert block.content_hash is not None
-
-        # cached_block_id = self._cached_blocks.get(block.content_hash, None)
-        # if cached_block_id is not None:
-        #     self.metric_data.query(hit=True)
-        #     block.block_id = cached_block_id
-        #     self._incr_refcount_cached_block(block)
-        #     alloc = self._alloc_pool.wrap_block(block)
-        #     return alloc
-        # self._alloc_pool.free_block(block)
         self.metric_data.query(hit=False)
 
         # No cached block => Allocate a new block
@@ -292,6 +242,53 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         self._incr_refcount_cached_block(block)
 
         alloc = MTAllocationOutput(block)
+        return alloc
+
+    def allocate_placeholder_block(self,
+                                   prev_block: Optional[Block],
+                                   token_ids: List[int],
+                                   content_hash: Optional[int] = None,
+                                   device: Optional[Device] = None) -> Block:
+        assert device is None
+
+        block = self._block_pool.init_block(
+            prev_block=prev_block,
+            token_ids=token_ids,
+            block_size=self._block_size,
+            physical_block_id=None,
+        )
+        block.set_state(BlockState.PLACEHOLDER)
+        assert isinstance(block, MTPrefixCachingBlock)
+        if content_hash is not None:
+            block.set_content_hash(content_hash)
+        assert block.content_hash is not None
+
+        return block
+
+    def promote_placeholder_block(
+            self,
+            block: Block,
+            block_ids_in_use: Optional[Set[BlockId]] = None
+    ) -> MTAllocationOutput:
+        """Promotes a placeholder block to an immutable block."""
+        assert block.state == BlockState.PLACEHOLDER
+        assert block.content_hash is not None
+        assert block.block_id is None
+        assert block.content_hash not in self._prefix_cache
+
+        self.metric_data.query(hit=False)
+
+        block_id, evicted_block = self._allocate_block_id(block_ids_in_use)
+
+        # Modify the block in place as it has been preallocated.
+        block.block_id = block_id
+        block.set_state(BlockState.ALLOCATED)
+
+        # Promote to immutable block.
+        self._prefix_cache.add(block.content_hash, block)
+        self._touched_blocks.add(block_id)
+
+        alloc = MTAllocationOutput(block, evicted_block)
         return alloc
 
     def allocate_immutable_blocks(
@@ -529,7 +526,13 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             "free_block_id is not supported in MTPrefixCachingBlockAllocator")
 
     def destroy(self, block: Block, keep_prefix_cache: bool = False) -> None:
+        if block.state == BlockState.PLACEHOLDER:
+            assert block.block_id is None
+            self._block_pool.free_block(block)
+            return
+
         assert block.state == BlockState.EVICTED
+
         if not keep_prefix_cache:
             assert block.content_hash is not None
             cached_block = self._prefix_cache.get(block.content_hash)
@@ -632,6 +635,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
                 the previously cached block matching the same content.
         """
         # Ensure block can be promoted
+        assert block.state == BlockState.ALLOCATED
         assert block.content_hash is not None
         assert block.block_id is not None
         assert self._refcounter.get(block.block_id) > 0
@@ -985,6 +989,14 @@ class MTPrefixCachingBlock(Block):
         # physical block index.
         if self.content_hash is not None:
             self.block_id = self._allocator.promote_to_immutable_block(self)
+
+    def set_content_hash(self, content_hash: int) -> None:
+        """Sets the content hash of the current block
+        
+        The block must be a placeholder block."""
+        assert self._cached_content_hash is None
+        assert self.state == BlockState.PLACEHOLDER
+        self._cached_content_hash = content_hash
 
     @property
     def block_id(self) -> Optional[int]:

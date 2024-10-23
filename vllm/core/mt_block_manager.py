@@ -31,7 +31,7 @@ class SequenceMeta:
         (
             self._cached_blocks,
             self._cached_blocks_to_move_in,
-            self._full_block_token_ids,
+            self._full_blocks,
             self._tail_block_token_ids,
         ) = self._split_sequence_tokens(seq.get_token_ids(), block_size)
         self._num_required_blocks: Optional[int] = None
@@ -53,8 +53,8 @@ class SequenceMeta:
         return self._cached_blocks_to_move_in
 
     @property
-    def full_block_token_ids(self):
-        return self._full_block_token_ids
+    def full_blocks(self):
+        return self._full_blocks
 
     @property
     def tail_block_token_ids(self):
@@ -103,23 +103,22 @@ class SequenceMeta:
 
         self._num_required_blocks = (len(cached_blocks_to_allocate) +
                                      len(self.cached_blocks_to_move_in) +
-                                     len(self.full_block_token_ids) +
-                                     num_tail_blocks)
+                                     len(self.full_blocks) + num_tail_blocks)
         return self._num_required_blocks
 
     def _split_sequence_tokens(
         self, token_ids: List[int], block_size: int
-    ) -> Tuple[List[Block], List[Block], List[List[int]], List[int]]:
+    ) -> Tuple[List[Block], List[Block], List[Block], List[int]]:
         """
         Returns:
             List[Block]: The blocks that are cached in the highest-tier device.
             List[Block]: The blocks that are cached in lower-tier devices.
-            List[List[int]]: The blocks that are full but not cached.
+            List[Block]: The blocks that are full but not cached.
             List[int]: The tail block.
         """
         cached_blocks: List[Block] = []
         cached_blocks_to_move_in: List[Block] = []
-        full_block_token_ids: List[List[int]] = []
+        full_blocks: List[Block] = []
 
         block_token_ids: List[List[int]] = []
         tail_block_token_ids: List[int] = []
@@ -132,6 +131,7 @@ class SequenceMeta:
         block_token_ids_iter = iter(block_token_ids)
         content_hash = None
         cached_block = None
+        prev_block = None
         # Highest-tier device
         while (cur_block_token_ids := next(block_token_ids_iter,
                                            None)) is not None:
@@ -140,12 +140,20 @@ class SequenceMeta:
                 cur_block_token_ids,
             )
             if cached_block is None:
-                full_block_token_ids.append(cur_block_token_ids)
+                placeholder_block = (
+                    self._allocator.allocate_placeholder_block(
+                        prev_block=prev_block,
+                        token_ids=cur_block_token_ids,
+                        content_hash=content_hash))
+                full_blocks.append(placeholder_block)
+                prev_block = placeholder_block
                 break
             if self._allocator.get_device_tier(cached_block) > 0:
                 cached_blocks_to_move_in.append(cached_block)
+                prev_block = cached_block
                 break
             cached_blocks.append(cached_block)
+            prev_block = cached_block
 
         # Lower-tier devices
         if cached_block is not None:
@@ -156,17 +164,29 @@ class SequenceMeta:
                     cur_block_token_ids,
                 )
                 if cached_block is None:
-                    full_block_token_ids.append(cur_block_token_ids)
+                    placeholder_block = (
+                        self._allocator.allocate_placeholder_block(
+                            prev_block=prev_block,
+                            token_ids=cur_block_token_ids,
+                            content_hash=content_hash))
+                    full_blocks.append(placeholder_block)
+                    prev_block = placeholder_block
                     break
                 cached_blocks_to_move_in.append(cached_block)
+                prev_block = cached_block
 
         # Uncached blocks
-        full_block_token_ids.extend(block_token_ids_iter)
+        while (cur_block_token_ids := next(block_token_ids_iter,
+                                           None)) is not None:
+            placeholder_block = self._allocator.allocate_placeholder_block(
+                prev_block=prev_block, token_ids=cur_block_token_ids)
+            full_blocks.append(placeholder_block)
+            prev_block = placeholder_block
 
         return (
             cached_blocks,
             cached_blocks_to_move_in,
-            full_block_token_ids,
+            full_blocks,
             tail_block_token_ids,
         )
 
@@ -180,6 +200,12 @@ class SequenceMeta:
         )
         cached_block = self._allocator.get_cached_block(content_hash)
         return content_hash, cached_block
+
+    def deallocate(self) -> None:
+        # Destroy placeholder blocks.
+        for block in self.full_blocks:
+            self._allocator.destroy(block)
+            assert block.state == BlockState.UNINIT
 
 
 # class MTBlockSpaceManager(BlockSpaceManager):
@@ -360,7 +386,7 @@ class MTBlockSpaceManager:
             token_ids=seq_meta.sequence.get_token_ids(),
             cached_blocks=seq_meta.cached_blocks,
             cached_blocks_to_move_in=seq_meta.cached_blocks_to_move_in,
-            full_block_token_ids=seq_meta.full_block_token_ids,
+            full_blocks=seq_meta.full_blocks,
             tail_block_token_ids=seq_meta.tail_block_token_ids,
             block_ids_in_use=block_ids_in_use,
         )

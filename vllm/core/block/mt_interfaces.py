@@ -55,6 +55,21 @@ class MTBlockAllocator(BlockAllocator):
         pass
 
     @abstractmethod
+    def allocate_placeholder_block(self,
+                                   prev_block: Optional[Block],
+                                   token_ids: List[int],
+                                   content_hash: Optional[int] = None,
+                                   device: Optional[Device] = None) -> Block:
+        pass
+
+    @abstractmethod
+    def promote_placeholder_block(
+            self,
+            block: Block,
+            block_ids_in_use: Optional[Set[int]] = None) -> MTAllocationOutput:
+        pass
+
+    @abstractmethod
     def fork(self, last_block: Block) -> Sequence[MTAllocationOutput]:
         pass
 
@@ -113,6 +128,24 @@ class MTDeviceAwareBlockAllocator(DeviceAwareBlockAllocator):
 
     @abstractmethod
     def allocate_cached_block(self, block: Block) -> MTAllocationOutput:
+        pass
+
+    @abstractmethod
+    def allocate_placeholder_block(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        content_hash: Optional[int] = None,
+    ) -> Block:
+        pass
+
+    @abstractmethod
+    def promote_placeholder_block(
+        self,
+        block: Block,
+        device: Device,
+        block_ids_in_use: Optional[Set[int]] = None,
+    ) -> MTAllocationOutput:
         pass
 
     @abstractmethod

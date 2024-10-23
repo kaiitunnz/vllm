@@ -83,7 +83,7 @@ class MTBlockTable:
         token_ids: List[int],
         cached_blocks: List[Block],
         cached_blocks_to_move_in: List[Block],
-        full_block_token_ids: List[List[int]],
+        full_blocks: List[Block],
         tail_block_token_ids: List[int],
         block_ids_in_use: Set[int],
         device: Device = Device.GPU,
@@ -103,7 +103,7 @@ class MTBlockTable:
         blocks = self._allocate_blocks_for_token_ids(
             cached_blocks=cached_blocks,
             cached_blocks_to_move_in=cached_blocks_to_move_in,
-            full_block_token_ids=full_block_token_ids,
+            full_blocks=full_blocks,
             tail_block_token_ids=tail_block_token_ids,
             block_ids_in_use=block_ids_in_use,
             device=device,
@@ -279,7 +279,7 @@ class MTBlockTable:
         self,
         cached_blocks: List[Block],
         cached_blocks_to_move_in: List[Block],
-        full_block_token_ids: List[List[int]],
+        full_blocks: List[Block],
         tail_block_token_ids: List[int],
         block_ids_in_use: Set[int],
         device: Device,
@@ -300,17 +300,12 @@ class MTBlockTable:
         blocks_to_move_out = []
         prev_block = None
         # Uncached blocks
-        if full_block_token_ids:
-            alloc_outputs = self._allocator.allocate_immutable_blocks(
-                prev_block,
-                block_token_ids=full_block_token_ids,
-                device=device,
-                block_ids_in_use=block_ids_in_use,
-            )
-            for alloc in alloc_outputs:
-                if alloc.evicted_meta is not None:
-                    blocks_to_move_out.append(alloc.evicted_meta)
-                blocks.append(alloc.block)
+        for block in full_blocks:
+            alloc = self._allocator.promote_placeholder_block(
+                block, device=device, block_ids_in_use=block_ids_in_use)
+            if alloc.evicted_meta is not None:
+                blocks_to_move_out.append(alloc.evicted_meta)
+            blocks.append(alloc.block)
             prev_block = blocks[-1]
 
         # Tail block

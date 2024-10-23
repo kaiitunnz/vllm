@@ -13,6 +13,7 @@ class BlockState(enum.Enum):
     ALLOCATED = enum.auto()
     EVICTED = enum.auto()
     FREED = enum.auto()
+    PLACEHOLDER = enum.auto()  # Cannot be used until allocated
 
 
 class EvictedBlockMetaData:

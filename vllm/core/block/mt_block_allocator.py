@@ -1,7 +1,8 @@
 from logging import Logger
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from vllm.core.block.interfaces import Block, BlockId, EvictedBlockMetaData
+from vllm.core.block.interfaces import (Block, BlockId, BlockState,
+                                        EvictedBlockMetaData)
 from vllm.core.block.mt_interfaces import (MTAllocationOutput,
                                            MTBlockAllocator,
                                            MTDeviceAwareBlockAllocator)
@@ -262,6 +263,29 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
     def allocate_cached_block(self, block: Block) -> MTAllocationOutput:
         return self._allocators[self.get_device(block)].allocate_cached_block(
             block)
+
+    def allocate_placeholder_block(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        content_hash: Optional[int] = None,
+    ) -> Block:
+        # Use the top-tier device's allocator to allocate placeholder blocks.
+        return (
+            self._allocators[self._device_tier[0]].allocate_placeholder_block(
+                prev_block, token_ids, content_hash=content_hash))
+
+    def promote_placeholder_block(
+        self,
+        block: Block,
+        device: Device,
+        block_ids_in_use: Optional[Set[BlockId]] = None,
+    ) -> MTAllocationOutput:
+        # Placeholder blocks are allocated by the top-tier device's allocator.
+        assert device == self._device_tier[0]
+        return (
+            self._allocators[self._device_tier[0]].promote_placeholder_block(
+                block, block_ids_in_use))
 
     def free(self, block: Block) -> None:
         """Frees the memory occupied by the given block.
@@ -556,7 +580,9 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
         return self._prefix_cache.get(content_hash)
 
     def destroy(self, block: Block) -> None:
-        self._allocators[self.get_device(block)].destroy(block)
+        device = (self._device_tier[0] if block.state == BlockState.PLACEHOLDER
+                  else self.get_device(block))
+        self._allocators[device].destroy(block)
 
     def print_content(self, logger: Logger):
         # TODO(noppanat): Remove this.

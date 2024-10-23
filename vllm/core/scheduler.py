@@ -1105,18 +1105,22 @@ class Scheduler:
                 num_lookahead_slots=num_lookahead_slots,
                 allocated_evicted_blocks=allocated_evicted_blocks,
             )
-            if can_allocate == AllocStatus.LATER:
-                break
-            elif can_allocate == AllocStatus.NEVER:
-                logger.warning(
-                    "Input prompt (%d tokens) + lookahead slots (%d) is "
-                    "too long and exceeds the capacity of block_manager",
-                    num_new_tokens, num_lookahead_slots)
-                for seq in waiting_seqs:
-                    seq.status = SequenceStatus.FINISHED_IGNORED
-                ignored_seq_groups.append(seq_group)
-                waiting_queue.popleft()
-                continue
+            if can_allocate != AllocStatus.OK:
+                # Deallocate placeholder blocks held by seq_metas.
+                for seq_meta in seq_metas:
+                    seq_meta.deallocate()
+                if can_allocate == AllocStatus.LATER:
+                    break
+                elif can_allocate == AllocStatus.NEVER:
+                    logger.warning(
+                        "Input prompt (%d tokens) + lookahead slots (%d) is "
+                        "too long and exceeds the capacity of block_manager",
+                        num_new_tokens, num_lookahead_slots)
+                    for seq in waiting_seqs:
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(seq_group)
+                    waiting_queue.popleft()
+                    continue
 
             # Allocate
             waiting_queue.popleft()
