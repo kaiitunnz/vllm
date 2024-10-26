@@ -91,6 +91,96 @@ class CacheEngine:
             self.num_gpu_blocks, self.device_config.device_type)
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
+    @classmethod
+    def from_config(
+        cls,
+        cache_config: CacheConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+        device_config: DeviceConfig,
+    ) -> "CacheEngine":
+        if cache_config.enable_multi_tier_prefix_caching:
+            return AsyncCacheEngine(cache_config, model_config,
+                                    parallel_config, device_config)
+        return cls(cache_config, model_config, parallel_config, device_config)
+
+    @property
+    def swap_manager(self) -> Optional[SwapManager]:
+        return None
+
+    def _allocate_kv_cache(
+        self,
+        num_blocks: int,
+        device: str,
+    ) -> List[torch.Tensor]:
+        """Allocates KV cache on the specified device."""
+        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+        pin_memory = is_pin_memory_available() if device == "cpu" else False
+        kv_cache: List[torch.Tensor] = []
+        for _ in range(self.num_attention_layers):
+            # null block in CpuGpuBlockAllocator requires at least that
+            # block to be zeroed-out.
+            # We zero-out everything for simplicity.
+            kv_cache.append(
+                torch.zeros(kv_cache_shape,
+                            dtype=self.dtype,
+                            pin_memory=pin_memory,
+                            device=device))
+        return kv_cache
+
+    def swap_in(self, src_to_dst: torch.Tensor) -> None:
+        for i in range(self.num_attention_layers):
+            self.attn_backend.swap_blocks(self.cpu_cache[i], self.gpu_cache[i],
+                                          src_to_dst)
+
+    def swap_out(self, src_to_dst: torch.Tensor) -> None:
+        for i in range(self.num_attention_layers):
+            self.attn_backend.swap_blocks(self.gpu_cache[i], self.cpu_cache[i],
+                                          src_to_dst)
+
+    def copy(self, src_to_dsts: torch.Tensor) -> None:
+        self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
+
+    def begin_cache_ops(self) -> None:
+        # No-op for synchronous cache engine.
+        pass
+
+    @staticmethod
+    def get_cache_block_size(
+        cache_config: CacheConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+    ) -> int:
+        head_size = model_config.get_head_size()
+        num_heads = model_config.get_num_kv_heads(parallel_config)
+        num_attention_layers = model_config.get_num_attention_layers(
+            parallel_config)
+
+        key_cache_block = cache_config.block_size * num_heads * head_size
+        value_cache_block = key_cache_block
+        total = num_attention_layers * (key_cache_block + value_cache_block)
+        if cache_config.cache_dtype == "auto":
+            dtype = model_config.dtype
+        else:
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+        dtype_size = get_dtype_size(dtype)
+        return dtype_size * total
+
+
+class AsyncCacheEngine(CacheEngine):
+    """Asynchronous version of CacheEngine."""
+
+    def __init__(
+        self,
+        cache_config: CacheConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+        device_config: DeviceConfig,
+    ) -> None:
+        super().__init__(cache_config, model_config, parallel_config,
+                         device_config)
+
         self._swap_queue: SimpleQueue[Optional[_SwapMessage]] = SimpleQueue()
         self._wait_sema: Semaphore = Semaphore(0)
         self._swap_manager = SwapManager(self._wait_sema)
@@ -117,27 +207,6 @@ class CacheEngine:
         self._swap_thread.daemon = True
         self._swap_thread.start()
 
-    def _allocate_kv_cache(
-        self,
-        num_blocks: int,
-        device: str,
-    ) -> List[torch.Tensor]:
-        """Allocates KV cache on the specified device."""
-        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
-        pin_memory = is_pin_memory_available() if device == "cpu" else False
-        kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_attention_layers):
-            # null block in CpuGpuBlockAllocator requires at least that
-            # block to be zeroed-out.
-            # We zero-out everything for simplicity.
-            kv_cache.append(
-                torch.zeros(kv_cache_shape,
-                            dtype=self.dtype,
-                            pin_memory=pin_memory,
-                            device=device))
-        return kv_cache
-
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         self._swap_queue.put((CacheOp.SWAP_IN, src_to_dst))
         self._do_cache_ops = True
@@ -152,31 +221,6 @@ class CacheEngine:
 
     def begin_cache_ops(self) -> None:
         self._swap_queue.put((CacheOp.START, None))
-
-    @staticmethod
-    def get_cache_block_size(
-        cache_config: CacheConfig,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-    ) -> int:
-        head_size = model_config.get_head_size()
-        num_heads = model_config.get_num_kv_heads(parallel_config)
-        num_attention_layers = model_config.get_num_attention_layers(
-            parallel_config)
-
-        key_cache_block = cache_config.block_size * num_heads * head_size
-        value_cache_block = key_cache_block
-        total = num_attention_layers * (key_cache_block + value_cache_block)
-        if cache_config.cache_dtype == "auto":
-            dtype = model_config.dtype
-        else:
-            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-        dtype_size = get_dtype_size(dtype)
-        return dtype_size * total
-
-    def __del__(self):
-        self._swap_queue.put(None)
-        self._swap_thread.join()
 
 
 def _swap_thread_func(queue: SimpleQueue[Optional[_SwapMessage]],
