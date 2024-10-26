@@ -222,6 +222,10 @@ class AsyncCacheEngine(CacheEngine):
     def begin_cache_ops(self) -> None:
         self._swap_queue.put((CacheOp.START, None))
 
+    def __del__(self):
+        self._swap_queue.put(None)
+        self._swap_thread.join()
+
 
 def _swap_thread_func(queue: SimpleQueue[Optional[_SwapMessage]],
                       wait_sema: Semaphore, num_attention_layers: int,
