@@ -662,9 +662,9 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         # If the cached block is freed, allocate it.
         cached_block_id = cached_block.block_id
         assert cached_block_id is not None
-        # This is handled by _incr_refcount_cached_block.
+        # NOTE(noppanat): This is handled by _incr_refcount_cached_block.
         # if cached_block_id in self.evictor:
-            # self.evictor.remove(cached_block_id)
+        # self.evictor.remove(cached_block_id)
         block.block_id = cached_block_id
 
         # Increment refcount of the cached block and (possibly) restore
