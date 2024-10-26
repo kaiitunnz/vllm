@@ -238,8 +238,9 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         assert block.content_hash in self._prefix_cache
         assert block.block_id is not None
         self.metric_data.query(hit=True)
-        self._block_tracker[block.block_id].hit()
         self._incr_refcount_cached_block(block)
+        # Hit after _incr_refcount_cached_block as it resets the hit count.
+        self._block_tracker[block.block_id].hit()
 
         alloc = MTAllocationOutput(block)
         return alloc
@@ -352,10 +353,12 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         refcount = self._refcounter.incr(block_id)
         if refcount == 1:
             # In case a cached block was evicted, restore its tracking
+            hit_count = 0
             if block_id in self.evictor:
-                self.evictor.remove(block_id)
+                block_meta = self.evictor.remove(block_id)
+                hit_count = block_meta.hit_count
 
-            self._track_block_id(block_id, computed=True)
+            self._track_block_id(block_id, computed=True, hit_count=hit_count)
 
     def _decr_refcount_cached_block(self, block: Block) -> None:
         # Ensure this is immutable/cached block
@@ -436,7 +439,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             block_id = alloc.block.block_id
             self._hashless_allocator._block_pool.free_block(alloc.block)
 
-            self._track_block_id(block_id, computed=False)
+            self._track_block_id(block_id, computed=False, hit_count=0)
             return block_id
         except MTBlockAllocator.NoFreeBlocksError:
             return None
@@ -485,7 +488,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         # self._cached_blocks.pop(content_hash_to_evict)
 
         self._refcounter.incr(block_id)
-        self._track_block_id(block_id, computed=False)
+        self._track_block_id(block_id, computed=False, hit_count=0)
 
         return block_id, evicted_meta
 
@@ -659,8 +662,9 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         # If the cached block is freed, allocate it.
         cached_block_id = cached_block.block_id
         assert cached_block_id is not None
-        if cached_block_id in self.evictor:
-            self.evictor.remove(cached_block_id)
+        # This is handled by _incr_refcount_cached_block.
+        # if cached_block_id in self.evictor:
+            # self.evictor.remove(cached_block_id)
         block.block_id = cached_block_id
 
         # Increment refcount of the cached block and (possibly) restore
@@ -731,11 +735,12 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             self._block_tracker[block_id].computed = True
         self._touched_blocks.clear()
 
-    def _track_block_id(self, block_id: Optional[BlockId],
-                        computed: bool) -> None:
+    def _track_block_id(self, block_id: Optional[BlockId], computed: bool,
+                        hit_count: int) -> None:
         assert block_id is not None
         self._block_tracker[block_id].enable()
         self._block_tracker[block_id].computed = computed
+        self._block_tracker[block_id].hit_count = hit_count
 
     def _untrack_block_id(self, block_id: Optional[BlockId]) -> None:
         assert block_id is not None

@@ -3,9 +3,6 @@ from typing import Optional, OrderedDict, Set
 
 from vllm.core.block.interfaces import Block, BlockState, EvictedBlockMetaData
 from vllm.core.evictor_v2 import EvictionPolicy
-from vllm.utils import init_logger
-
-logger = init_logger(__name__)
 
 
 class MTEvictionError(Exception):
@@ -44,7 +41,7 @@ class MTEvictor(ABC):
         pass
 
     @abstractmethod
-    def remove(self, block_id: int):
+    def remove(self, block_id: int) -> EvictedBlockMetaData:
         """Remove a given block id from the cache."""
         pass
 
@@ -112,13 +109,14 @@ class LRUMTEvictor(MTEvictor):
     def update(self, block_id: int, last_accessed: float):
         self.free_table[block_id].last_accessed = last_accessed
 
-    def remove(self, block_id: int):
+    def remove(self, block_id: int) -> EvictedBlockMetaData:
         if block_id not in self.free_table:
             raise ValueError(
                 "Attempting to remove block that's not in the evictor")
         block_meta = self.free_table.pop(block_id)
         assert block_meta.block.state == BlockState.FREED
         block_meta.block.set_state(BlockState.ALLOCATED)
+        return block_meta
 
     @property
     def num_blocks(self) -> int:
