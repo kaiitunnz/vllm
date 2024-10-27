@@ -107,6 +107,7 @@ class EngineArgs:
     block_size: int = 16
     enable_prefix_caching: bool = False
     enable_multi_tier_prefix_caching: bool = False
+    enable_async_swapping: bool = False
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
@@ -370,6 +371,9 @@ class EngineArgs:
         parser.add_argument('--enable-multi-tier-prefix-caching',
                             action='store_true',
                             help='Enables multi-tier prefix caching.')
+        parser.add_argument('--enable-async-swapping',
+                            action='store_true',
+                            help='Enables asynchronous KV cache swapping.')
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '
@@ -925,6 +929,7 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             enable_multi_tier_prefix_caching=self.
             enable_multi_tier_prefix_caching,
+            enable_async_swapping=self.enable_async_swapping,
             cpu_offload_gb=self.cpu_offload_gb,
         )
         parallel_config = ParallelConfig(

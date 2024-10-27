@@ -99,7 +99,7 @@ class CacheEngine:
         parallel_config: ParallelConfig,
         device_config: DeviceConfig,
     ) -> "CacheEngine":
-        if cache_config.enable_multi_tier_prefix_caching:
+        if cache_config.enable_async_swapping:
             return AsyncCacheEngine(cache_config, model_config,
                                     parallel_config, device_config)
         return cls(cache_config, model_config, parallel_config, device_config)

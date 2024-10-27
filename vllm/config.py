@@ -590,6 +590,7 @@ class CacheConfig:
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
         enable_multi_tier_prefix_caching: bool = False,
+        enable_async_swapping: bool = False,
         cpu_offload_gb: float = 0,
     ) -> None:
         self.block_size = block_size
@@ -601,6 +602,7 @@ class CacheConfig:
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_multi_tier_prefix_caching = enable_multi_tier_prefix_caching
+        self.enable_async_swapping = enable_async_swapping
         self.cpu_offload_gb = cpu_offload_gb
         self._verify_args()
         self._verify_cache_dtype()
@@ -636,6 +638,10 @@ class CacheConfig:
     def _verify_prefix_caching(self) -> None:
         if self.enable_multi_tier_prefix_caching:
             self.enable_prefix_caching = True
+            if not self.enable_async_swapping:
+                logger.warning("Multi-tier prefix caching is enabled, but "
+                               "async swapping is not enabled. This may lead "
+                               "to performance degradation.")
 
         if not self.enable_prefix_caching:
             return
