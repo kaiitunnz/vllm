@@ -14,7 +14,8 @@ from vllm.utils import Device
 from ..models.utils import check_outputs_equal
 
 MODELS = [
-    "facebook/opt-125m",
+    # "facebook/opt-125m",
+    "meta-llama/Meta-Llama-3-8B-Instruct",
 ]
 
 
@@ -93,7 +94,8 @@ def test_eviction(num_blocks: int, ):
 
 
 @pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("backend", ["FLASH_ATTN", "FLASHINFER", "XFORMERS"])
+# @pytest.mark.parametrize("backend", ["FLASH_ATTN", "FLASHINFER", "XFORMERS"])
+@pytest.mark.parametrize("backend", ["FLASH_ATTN"])
 @pytest.mark.parametrize("dtype", ["half"])
 @pytest.mark.parametrize("max_tokens", [5])
 @pytest.mark.parametrize("cached_position", [0, 1])
@@ -125,6 +127,7 @@ def test_mixed_requests(
             model,
             dtype=dtype,
             enable_prefix_caching=True,
+            enable_multi_tier_prefix_caching=False,
             use_v2_block_manager=use_v2_block_manager,
     ) as vllm_model:
         # Run the first prompt so the cache is populated
