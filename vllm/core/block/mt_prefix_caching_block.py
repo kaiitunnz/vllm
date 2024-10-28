@@ -468,19 +468,24 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
 
         # Sanity checks
         cached_block = self._prefix_cache.get(content_hash_to_evict)
-        assert cached_block is not None
-        _block_id = cached_block.block_id
-        assert _block_id is not None
-        if block_id != _block_id:
-            # TODO(noppanat): Remove this.
-            # In this case, the block has been recomputed by the running
-            # sequences and is already in the highest-tier device.
-            self.destroy(evicted_block, keep_prefix_cache=True)
+        if cached_block is None:
+            # NOTE(noppanat): The cached block was somehow destroyed.
+            # Free the evicted block directly.
+            self._block_pool.free_block(evicted_block)
             evicted_meta = None
-        elif evicted_meta.hit_count < self._hit_count_threshold:
-            # The block does not have enough hits to be evicted.
-            self.destroy(evicted_block, keep_prefix_cache=False)
-            evicted_meta = None
+        else:
+            _block_id = cached_block.block_id
+            assert _block_id is not None
+            if block_id != _block_id:
+                # TODO(noppanat): Remove this.
+                # In this case, the block has been recomputed by the running
+                # sequences and is already in the highest-tier device.
+                self.destroy(evicted_block, keep_prefix_cache=True)
+                evicted_meta = None
+            elif evicted_meta.hit_count < self._hit_count_threshold:
+                # The block does not have enough hits to be evicted.
+                self.destroy(evicted_block, keep_prefix_cache=False)
+                evicted_meta = None
 
         # assert _block_id is not None
         assert self._refcounter.get(block_id) == 0
