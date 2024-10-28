@@ -21,6 +21,8 @@ class CacheOp(enum.Enum):
     SWAP_IN = enum.auto()
     SWAP_OUT = enum.auto()
     COPY = enum.auto()
+    PREFETCH = enum.auto()
+    UNLOAD = enum.auto()
     START = enum.auto()
 
 
@@ -139,6 +141,14 @@ class CacheEngine:
             self.attn_backend.swap_blocks(self.gpu_cache[i], self.cpu_cache[i],
                                           src_to_dst)
 
+    def prefetch(self, src_to_dst: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "Prefetch is not supported for synchronous cache engine.")
+
+    def unload(self, src_to_dst: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "Unload is not supported for synchronous cache engine.")
+
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
 
@@ -219,6 +229,16 @@ class AsyncCacheEngine(CacheEngine):
         self._swap_queue.put((CacheOp.COPY, src_to_dsts))
         self._do_cache_ops = True
 
+    def prefetch(self, src_to_dst: torch.Tensor) -> None:
+        self._swap_queue.put((CacheOp.PREFETCH, src_to_dst))
+        # Not set _do_cache_ops to True, because prefetching is not a necessary
+        # cache operation.
+
+    def unload(self, src_to_dst: torch.Tensor) -> None:
+        self._swap_queue.put((CacheOp.UNLOAD, src_to_dst))
+        # Not set _do_cache_ops to True, because unloading is not a necessary
+        # cache operation.
+
     def begin_cache_ops(self) -> None:
         self._swap_queue.put((CacheOp.START, None))
 
@@ -233,7 +253,8 @@ def _swap_thread_func(queue: SimpleQueue[Optional[_SwapMessage]],
                       gpu_cache: List[torch.Tensor],
                       cpu_cache: List[torch.Tensor]) -> None:
     stream = torch.cuda.Stream()
-    to_swap_in = to_swap_out = to_copy = None
+    pending_event: Optional[torch.cuda.Event] = None
+    to_swap_in = to_swap_out = to_copy = to_prefetch = to_unload = None
     with torch.cuda.stream(stream):
         while True:
             msg = queue.get()
@@ -249,21 +270,40 @@ def _swap_thread_func(queue: SimpleQueue[Optional[_SwapMessage]],
             elif op == CacheOp.COPY:
                 assert to_copy is None and src_to_dst is not None
                 to_copy = src_to_dst
+            elif op == CacheOp.PREFETCH:
+                assert to_prefetch is None and src_to_dst is not None
+                to_prefetch = src_to_dst
+            elif op == CacheOp.UNLOAD:
+                assert to_unload is None and src_to_dst is not None
+                to_unload = src_to_dst
             elif op == CacheOp.START:
-                if ((to_swap_in is None) and (to_swap_out is None)
-                        and (to_copy is None)):
-                    continue
-                assert src_to_dst is None
-                assert wait_sema._value == 0
-                for i in range(num_attention_layers):
-                    if to_swap_out is not None:
-                        attn_backend.swap_blocks(gpu_cache[i], cpu_cache[i],
-                                                 to_swap_out)
-                    if to_swap_in is not None:
-                        attn_backend.swap_blocks(cpu_cache[i], gpu_cache[i],
-                                                 to_swap_in)
-                    if to_copy is not None:
-                        attn_backend.copy_blocks(gpu_cache, to_copy)
-                    stream.record_event().synchronize()
-                    wait_sema.release()
-                to_swap_in = to_swap_out = to_copy = None
+                if pending_event is not None:
+                    pending_event.synchronize()
+                    pending_event = None
+                if not ((to_swap_in is None) and (to_swap_out is None) and
+                        (to_copy is None)):
+                    assert src_to_dst is None
+                    assert wait_sema._value == 0
+                    for i in range(num_attention_layers):
+                        if to_swap_out is not None:
+                            attn_backend.swap_blocks(gpu_cache[i],
+                                                     cpu_cache[i], to_swap_out)
+                        if to_swap_in is not None:
+                            attn_backend.swap_blocks(cpu_cache[i],
+                                                     gpu_cache[i], to_swap_in)
+                        if to_copy is not None:
+                            attn_backend.copy_blocks(gpu_cache, to_copy)
+                        stream.record_event().synchronize()
+                        wait_sema.release()
+                    to_swap_in = to_swap_out = to_copy = None
+                if not ((to_prefetch is None) and (to_unload is None)):
+                    assert src_to_dst is None
+                    for i in range(num_attention_layers):
+                        if to_unload is not None:
+                            attn_backend.swap_blocks(gpu_cache[i],
+                                                     cpu_cache[i], to_unload)
+                        if to_prefetch is not None:
+                            attn_backend.swap_blocks(cpu_cache[i],
+                                                     gpu_cache[i], to_prefetch)
+                    pending_event = stream.record_event()
+                    to_prefetch = to_unload = None

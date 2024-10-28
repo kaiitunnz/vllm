@@ -8,6 +8,7 @@ from typing import (Callable, Deque, Dict, Iterable, List, Optional, Set,
                     Tuple, Union)
 
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.core.block.interfaces import Block
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.core.mt_block_manager import MTBlockSpaceManager, SequenceMeta
 from vllm.core.wait_queue import (MTWaitQueue, MTWaitQueueBase,
@@ -130,6 +131,10 @@ class SchedulerOutputs:
     blocks_to_swap_out: List[Tuple[int, int]]
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]]
+    # Blocks to prefetch. List of CPU -> GPU block number.
+    blocks_to_prefetch: List[Tuple[int, int]]
+    # Blocks to unload. List of GPU -> CPU block number.
+    blocks_to_unload: List[Tuple[int, int]]
     # Sequence groups that are going to be ignored.
     ignored_seq_groups: List[SequenceGroup]
     # The number of slots for lookahead decoding.
@@ -262,10 +267,16 @@ class SchedulerPrefillOutputs:
     seq_groups: List[ScheduledSequenceGroup]
     # Ignored sequence groups.
     ignored_seq_groups: List[SequenceGroup]
-    # The blocks to swap in.
-    blocks_to_swap_in: List[Tuple[int, int]]
-    # The blocks to swap out.
-    blocks_to_swap_out: List[Tuple[int, int]]
+    # The blocks to move in.
+    blocks_to_move_in: List[Tuple[int, int]]
+    # The blocks to move out.
+    blocks_to_move_out: List[Tuple[int, int]]
+    # The blocks to prefetch.
+    blocks_to_prefetch: List[Tuple[int, int]]
+    # The blocks to prefetch. This is equivalent to blocks_to_move_out but
+    # instead corresponds to the blocks to prefetch.
+    blocks_to_unload: List[Tuple[int, int]]
+
     num_lookahead_slots: int
 
     @classmethod
@@ -273,8 +284,10 @@ class SchedulerPrefillOutputs:
         return SchedulerPrefillOutputs(
             seq_groups=[],
             ignored_seq_groups=[],
-            blocks_to_swap_in=[],
-            blocks_to_swap_out=[],
+            blocks_to_move_in=[],
+            blocks_to_move_out=[],
+            blocks_to_prefetch=[],
+            blocks_to_unload=[],
             num_lookahead_slots=0,
         )
 
@@ -1005,8 +1018,10 @@ class Scheduler:
         return SchedulerPrefillOutputs(
             seq_groups=seq_groups,
             ignored_seq_groups=ignored_seq_groups,
-            blocks_to_swap_in=[],
-            blocks_to_swap_out=[],
+            blocks_to_move_in=[],
+            blocks_to_move_out=[],
+            blocks_to_prefetch=[],
+            blocks_to_unload=[],
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking))
 
@@ -1056,6 +1071,7 @@ class Scheduler:
         allocated_evicted_blocks: List[int] = []
 
         with self.waiting as waiting_queue:
+            # Try allocating.
             while waiting_queue:
                 if not self._passed_delay(time.time()):
                     break
@@ -1156,6 +1172,7 @@ class Scheduler:
                 for seq_meta in seq_metas
             ])
 
+            # Perform actual allocation.
             for seq_group, seq_metas, seq_group_meta in zip(
                     seq_groups_to_allocate, seq_metas_to_allocate,
                     seq_group_meta_list):
@@ -1193,33 +1210,71 @@ class Scheduler:
                                               num_new_tokens)
                 budget.add_num_seqs(seq_group.request_id, num_new_seqs)
 
+            blocks_to_move_in, blocks_to_move_out = (
+                self._get_and_reset_blocks_to_move())
+
+        if self.scheduler_config.enable_async_prefetching:
+            # Try to prefetch blocks that are likely to be used in the next
+            # prefilling step.
+            with self.waiting as waiting_queue:
+                prefetchable = waiting_queue.get_prefetchable()
+                block_ids_in_use = self.block_manager.get_block_ids_in_use([
+                    seq_meta for _, seq_metas in prefetchable
+                    for seq_meta in seq_metas
+                ])
+                moved_in_blocks: List[Block] = []
+                num_usable_blocks: Optional[int] = None
+                for seq_group, seq_metas in prefetchable:
+                    num_usable_blocks = self.block_manager.prefetch(
+                        seq_group,
+                        seq_metas,
+                        moved_in_blocks,
+                        block_ids_in_use=block_ids_in_use,
+                        num_usable_blocks=num_usable_blocks)
+                    if not num_usable_blocks:
+                        break
+                # Must free the blocks so that they can be evicted in the next
+                # step.
+                self.block_manager.free_blocks(moved_in_blocks)
+
+                blocks_to_prefetch, blocks_to_unload = (
+                    self._get_and_reset_blocks_to_move())
+        else:
+            blocks_to_prefetch = []
+            blocks_to_unload = []
+
         # Queue requests that couldn't be scheduled.
         self.waiting.extendleft(leftover_waiting_sequences)
         if len(seq_groups) > 0:
             self.prev_prompt = True
 
-        # Process block moving operations needed for the allocations
-        moving_record = self.block_manager.get_and_reset_block_moving_record()
-        blocks_to_swap_in = []
-        blocks_to_swap_out = []
-        # TODO(noppanat): Handle more device tiers.
-        for (dst_device,
-             dst_block_id), (src_device,
-                             src_block_id) in moving_record.items():
-            if src_device == Device.GPU and dst_device == Device.CPU:
-                blocks_to_swap_out.append((src_block_id, dst_block_id))
-            elif src_device == Device.CPU and dst_device == Device.GPU:
-                blocks_to_swap_in.append((src_block_id, dst_block_id))
-            else:
-                raise NotImplementedError("Unsupported block moving operation")
-
         return SchedulerPrefillOutputs(
             seq_groups=seq_groups,
             ignored_seq_groups=ignored_seq_groups,
-            blocks_to_swap_in=blocks_to_swap_in,
-            blocks_to_swap_out=blocks_to_swap_out,
+            blocks_to_move_in=blocks_to_move_in,
+            blocks_to_move_out=blocks_to_move_out,
+            blocks_to_prefetch=blocks_to_prefetch,
+            blocks_to_unload=blocks_to_unload,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking))
+
+    def _get_and_reset_blocks_to_move(
+            self) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        # Process block moving operations needed for the allocations
+        moving_record = self.block_manager.get_and_reset_block_moving_record()
+        blocks_to_move_in = []
+        blocks_to_move_out = []
+        # TODO(noppanat): Handle more device tiers.
+        for dst, src in moving_record.items():
+            dst_device, dst_block_id = dst
+            src_device, src_block_id = src
+            if src_device == Device.GPU and dst_device == Device.CPU:
+                blocks_to_move_out.append((src_block_id, dst_block_id))
+            elif src_device == Device.CPU and dst_device == Device.GPU:
+                blocks_to_move_in.append((src_block_id, dst_block_id))
+            else:
+                raise NotImplementedError("Unsupported block moving operation")
+        return blocks_to_move_in, blocks_to_move_out
 
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
@@ -1319,9 +1374,9 @@ class Scheduler:
         if self.scheduler_config.use_mt_block_manager:
             # NOTE(noppanat): Swapping is not supported.
             assert len(swapped_in.blocks_to_swap_in) == 0
-            blocks_to_swap_in = prefills.blocks_to_swap_in
+            blocks_to_swap_in = prefills.blocks_to_move_in
             assert len(running_scheduled.blocks_to_swap_out) == 0
-            blocks_to_swap_out = prefills.blocks_to_swap_out
+            blocks_to_swap_out = prefills.blocks_to_move_out
         else:
             blocks_to_swap_in = swapped_in.blocks_to_swap_in
             blocks_to_swap_out = running_scheduled.blocks_to_swap_out
@@ -1333,6 +1388,8 @@ class Scheduler:
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
+            blocks_to_prefetch=prefills.blocks_to_prefetch,
+            blocks_to_unload=prefills.blocks_to_unload,
             ignored_seq_groups=ignored_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
             running_queue_size=len(self.running),
@@ -1415,6 +1472,8 @@ class Scheduler:
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
+            blocks_to_prefetch=prefills.blocks_to_prefetch,
+            blocks_to_unload=prefills.blocks_to_unload,
             ignored_seq_groups=prefills.ignored_seq_groups +
             swapped_in.infeasible_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,

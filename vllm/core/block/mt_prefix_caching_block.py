@@ -588,12 +588,14 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
 
         return forked_allocs
 
-    def get_num_free_blocks(self, device: Optional[Device] = None) -> int:
+    def get_num_free_blocks(self,
+                            block_ids_in_use: Optional[Set[int]] = None,
+                            device: Optional[Device] = None) -> int:
         assert device is None
         # The number of free blocks is the number of hashless free blocks
         # plus the number of blocks evictor could free from its list.
         return self._hashless_allocator.get_num_free_blocks(
-        ) + self.evictor.num_blocks
+        ) + self.evictor.get_num_free_blocks(block_ids_in_use)
 
     def get_num_total_blocks(self) -> int:
         return self._hashless_allocator.get_num_total_blocks()

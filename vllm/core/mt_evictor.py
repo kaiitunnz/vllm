@@ -50,6 +50,12 @@ class MTEvictor(ABC):
     def num_blocks(self) -> int:
         pass
 
+    @abstractmethod
+    def get_num_free_blocks(self,
+                            blocks_id_in_use: Optional[Set[int]] = None
+                            ) -> int:
+        pass
+
 
 class LRUMTEvictor(MTEvictor):
     """Evicts in a least-recently-used order using the last_accessed timestamp
@@ -121,6 +127,18 @@ class LRUMTEvictor(MTEvictor):
     @property
     def num_blocks(self) -> int:
         return len(self.free_table)
+
+    def get_num_free_blocks(self,
+                            blocks_id_in_use: Optional[Set[int]] = None
+                            ) -> int:
+        if blocks_id_in_use is None:
+            return len(self.free_table)
+
+        count = 0
+        for block_id in self.free_table:
+            if block_id not in blocks_id_in_use:
+                count += 1
+        return count
 
 
 def make_mt_evictor(eviction_policy: EvictionPolicy) -> MTEvictor:

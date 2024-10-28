@@ -962,6 +962,7 @@ class SchedulerConfig:
                  use_v2_block_manager: bool = True,
                  use_mt_block_manager: bool = False,
                  enable_prefix_aware_scheduling: bool = False,
+                 enable_async_prefetching: bool = False,
                  num_lookahead_slots: int = 0,
                  delay_factor: float = 0.0,
                  enable_chunked_prefill: bool = False,
@@ -1014,6 +1015,7 @@ class SchedulerConfig:
         self.use_v2_block_manager = use_v2_block_manager
         self.use_mt_block_manager = use_mt_block_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
+        self.enable_async_prefetching = enable_async_prefetching
         self.num_lookahead_slots = num_lookahead_slots
         self.delay_factor = delay_factor
         self.chunked_prefill_enabled = enable_chunked_prefill
@@ -1075,6 +1077,11 @@ class SchedulerConfig:
                     "Prefix-aware scheduling is not supported without "
                     "multi-tier block manager, disable it.")
                 self.enable_prefix_aware_scheduling = False
+            if self.enable_async_prefetching:
+                logger.warning(
+                    "Asynchronous prefetching is not supported without "
+                    "multi-tier block manager, disable it.")
+                self.enable_async_prefetching = False
 
     @property
     def is_multi_step(self) -> bool:

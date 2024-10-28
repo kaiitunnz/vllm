@@ -94,6 +94,12 @@ class MTBlockAllocator(BlockAllocator):
     def destroy(self, block: Block, keep_prefix_cache: bool = False) -> None:
         pass
 
+    @abstractmethod
+    def get_num_free_blocks(self,
+                            block_ids_in_use: Optional[Set[int]] = None
+                            ) -> int:
+        pass
+
 
 class MTDeviceAwareBlockAllocator(DeviceAwareBlockAllocator):
 
@@ -191,4 +197,11 @@ class MTDeviceAwareBlockAllocator(DeviceAwareBlockAllocator):
 
     @abstractmethod
     def get_device_tier_from_id(self, block_id: int) -> int:
+        pass
+
+    @abstractmethod
+    def get_num_free_blocks(
+            self,
+            device: Device,
+            block_ids_in_use: Optional[Set[int]] = None) -> int:
         pass

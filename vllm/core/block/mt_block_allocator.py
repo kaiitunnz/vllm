@@ -320,7 +320,10 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
         allocator = self._block_ids_to_allocator[block_id]
         return list(allocator.fork(last_block))
 
-    def get_num_free_blocks(self, device: Device) -> int:
+    def get_num_free_blocks(
+            self,
+            device: Device,
+            block_ids_in_use: Optional[Set[int]] = None) -> int:
         """Returns the number of free blocks available on the specified device.
 
         Args:
@@ -330,7 +333,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
         Returns:
             int: The number of free blocks available on the specified device.
         """
-        return self._allocators[device].get_num_free_blocks()
+        return self._allocators[device].get_num_free_blocks(block_ids_in_use)
 
     def get_num_total_blocks(self, device: Device) -> int:
         return self._allocators[device].get_num_total_blocks()

@@ -669,8 +669,37 @@ class MTBlockSpaceManager:
             return AllocStatus.LATER
 
     def get_and_reset_block_moving_record(
-        self, ) -> Dict[Tuple[Device, int], Tuple[Device, int]]:
+            self) -> Dict[Tuple[Device, int], Tuple[Device, int]]:
         return self.block_allocator.get_and_reset_block_moving_record()
+
+    def prefetch(self,
+                 seq_group: SequenceGroup,
+                 seq_metas: List[SequenceMeta],
+                 moved_in_blocks: List[Block],
+                 block_ids_in_use: Optional[Set[int]] = None,
+                 num_usable_blocks: Optional[int] = None,
+                 device: Device = Device.GPU) -> int:
+        # NOTE(noppanat): Assume exactly one waiting sequence in each sequence
+        # group as we do not support CoW.
+        assert len(seq_metas) == 1
+        assert len(seq_group.get_seqs(status=SequenceStatus.WAITING)) == 1
+
+        cached_blocks_to_move_in = seq_metas[0].cached_blocks_to_move_in
+        if num_usable_blocks is None:
+            # num_usable_blocks = self.block_allocator.get_num_free_blocks(
+            #     device, block_ids_in_use)
+            num_usable_blocks = (self.block_allocator.get_num_free_blocks(
+                device, block_ids_in_use) - self.watermark_blocks)
+        if num_usable_blocks >= 0:
+            to_move_in = cached_blocks_to_move_in[:num_usable_blocks]
+            self.block_allocator.move_in(to_move_in, block_ids_in_use)
+            moved_in_blocks.extend(to_move_in)
+            return num_usable_blocks - len(to_move_in)
+        return num_usable_blocks
+
+    def free_blocks(self, blocks: List[Block]) -> None:
+        for block in blocks:
+            self.block_allocator.free(block)
 
     def print_content(self):
         # TODO(noppanat): Remove this.

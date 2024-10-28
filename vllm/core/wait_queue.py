@@ -3,8 +3,8 @@ from abc import abstractmethod
 from collections import deque
 from typing import Deque, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from vllm.sequence import SequenceGroup, SequenceStatus
 from vllm.core.mt_block_manager import MTBlockSpaceManager, SequenceMeta
+from vllm.sequence import SequenceGroup, SequenceStatus
 
 
 class WaitQueueBase:
@@ -85,11 +85,12 @@ class WaitQueue(WaitQueueBase):
 
 class MTWaitQueueBase(WaitQueueBase):
     STATUS: SequenceStatus = SequenceStatus.WAITING
+    Item = Tuple[SequenceGroup, List[SequenceMeta]]
 
     class ContextManager:
 
         @abstractmethod
-        def peekleft(self) -> Tuple[SequenceGroup, List[SequenceMeta]]:
+        def peekleft(self) -> "MTWaitQueueBase.Item":
             pass
 
         @abstractmethod
@@ -98,6 +99,10 @@ class MTWaitQueueBase(WaitQueueBase):
 
         @abstractmethod
         def __bool__(self) -> bool:
+            pass
+
+        @abstractmethod
+        def get_prefetchable(self) -> List["MTWaitQueueBase.Item"]:
             pass
 
     @abstractmethod
@@ -119,7 +124,7 @@ class MTWaitQueue(MTWaitQueueBase):
             self._waiting: Deque[SequenceGroup] = waiting
             self._seq_meta_cache: Dict[SequenceGroup, List[SequenceMeta]] = {}
 
-        def peekleft(self) -> Tuple[SequenceGroup, List[SequenceMeta]]:
+        def peekleft(self) -> "MTWaitQueue.Item":
             seq_group = self._waiting[0]
             if seq_group not in self._seq_meta_cache:
                 seq_metas = self._block_manager.process_sequence_group(
@@ -137,6 +142,10 @@ class MTWaitQueue(MTWaitQueueBase):
 
         def __bool__(self) -> bool:
             return bool(self._waiting)
+
+        def get_prefetchable(self) -> List["MTWaitQueue.Item"]:
+            # Default MTWaitQueue does not support prefetching.
+            return []
 
     def __init__(self,
                  block_manager: MTBlockSpaceManager,
@@ -185,15 +194,14 @@ class MTWaitQueue(MTWaitQueueBase):
 
 class PrefixAwareWaitQueue(MTWaitQueueBase):
 
-    class ContextManager:
+    class ContextManager(MTWaitQueueBase.ContextManager):
 
-        def __init__(
-                self,
-                block_manager: MTBlockSpaceManager,
-                waiting: Deque[SequenceGroup],
-                dispenser: Deque[SequenceGroup],
-                window_size: int,
-                reorder_on_reset: bool = False):
+        def __init__(self,
+                     block_manager: MTBlockSpaceManager,
+                     waiting: Deque[SequenceGroup],
+                     dispenser: Deque[SequenceGroup],
+                     window_size: int,
+                     reorder_on_reset: bool = False):
             self._block_manager: MTBlockSpaceManager = block_manager
             self._waiting: Deque[SequenceGroup] = waiting
             self._dispenser: Deque[SequenceGroup] = dispenser
@@ -201,7 +209,7 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
             self._reorder_on_reset: bool = reorder_on_reset
             self._seq_meta_cache: Dict[SequenceGroup, List[SequenceMeta]] = {}
 
-        def peekleft(self) -> Tuple[SequenceGroup, List[SequenceMeta]]:
+        def peekleft(self) -> "PrefixAwareWaitQueue.Item":
             seq_group = self.get(0)
             if seq_group not in self._seq_meta_cache:
                 if self._reorder_on_reset:
@@ -224,18 +232,17 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
 
         def _process_and_sort(
             self, seq_groups: Iterable[SequenceGroup]
-        ) -> List[Tuple[SequenceGroup, List[SequenceMeta]]]:
+        ) -> List["PrefixAwareWaitQueue.Item"]:
 
             def process_seq_group(
-                seq_group: SequenceGroup
-            ) -> Tuple[SequenceGroup, List[SequenceMeta]]:
+                    seq_group: SequenceGroup) -> "PrefixAwareWaitQueue.Item":
                 assert seq_group not in self._seq_meta_cache
                 seq_metas = self._block_manager.process_sequence_group(
                     seq_group, status=PrefixAwareWaitQueue.STATUS)
                 return seq_group, seq_metas
 
             def sort_key(
-                item: Tuple[SequenceGroup, List[SequenceMeta]]
+                    item: "PrefixAwareWaitQueue.Item"
             ) -> Tuple[int, int, float]:
                 seq_group, seq_metas = item
                 seq_meta = seq_metas[0]
@@ -268,6 +275,17 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
         def __bool__(self) -> bool:
             return bool(self._dispenser) or bool(self._waiting)
 
+        def get_prefetchable(self) -> List["PrefixAwareWaitQueue.Item"]:
+            prefetchable: List["PrefixAwareWaitQueue.Item"] = []
+            for seq_group in self._dispenser:
+                seq_metas = self._seq_meta_cache.get(seq_group, None)
+                if seq_metas is None:
+                    seq_metas = self._block_manager.process_sequence_group(
+                        seq_group, status=PrefixAwareWaitQueue.STATUS)
+                    self._seq_meta_cache[seq_group] = seq_metas
+                prefetchable.append((seq_group, seq_metas))
+            return prefetchable
+
     def __init__(self,
                  block_manager: MTBlockSpaceManager,
                  waiting: Optional[Deque[SequenceGroup]] = None,
@@ -297,7 +315,7 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
     def extendleft(self, seq_groups: Iterable[SequenceGroup]) -> None:
         self._dispenser.extendleft(seq_groups)
 
-    def peekleft(self) -> Tuple[SequenceGroup, List[SequenceMeta]]:
+    def peekleft(self) -> "PrefixAwareWaitQueue.Item":
         seq_group = self[0]
         seq_metas = self._block_manager.process_sequence_group(
             seq_group, status=MTWaitQueue.STATUS)

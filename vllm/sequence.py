@@ -1328,6 +1328,12 @@ class ExecuteModelRequest(
                                    int]] = msgspec.field(default_factory=list)
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]] = msgspec.field(default_factory=list)
+    # Blocks to prefetch. Source to dest block.
+    blocks_to_prefetch: List[Tuple[int,
+                                   int]] = msgspec.field(default_factory=list)
+    # Blocks to unload. Source to dest block.
+    blocks_to_unload: List[Tuple[int,
+                                 int]] = msgspec.field(default_factory=list)
     # Virtual engine ID for pipeline parallel.
     virtual_engine: int = 0
     # The number of slots for lookahead decoding.

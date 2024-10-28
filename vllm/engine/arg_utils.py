@@ -108,6 +108,7 @@ class EngineArgs:
     enable_prefix_caching: bool = False
     enable_multi_tier_prefix_caching: bool = False
     enable_async_swapping: bool = False
+    enable_async_prefetching: bool = False
     enable_prefix_aware_scheduling: bool = False
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
@@ -375,6 +376,9 @@ class EngineArgs:
         parser.add_argument('--enable-async-swapping',
                             action='store_true',
                             help='Enables asynchronous KV cache swapping.')
+        parser.add_argument('--enable-async-prefetching',
+                            action='store_true',
+                            help='Enables asynchronous KV cache prefetching.')
         parser.add_argument('--enable-prefix-aware-scheduling',
                             action='store_true',
                             help='Enables prefix-aware scheduling.')
@@ -1045,6 +1049,7 @@ class EngineArgs:
             use_v2_block_manager=self.use_v2_block_manager,
             use_mt_block_manager=self.enable_multi_tier_prefix_caching,
             enable_prefix_aware_scheduling=self.enable_prefix_aware_scheduling,
+            enable_async_prefetching=self.enable_async_prefetching,
             num_lookahead_slots=num_lookahead_slots,
             delay_factor=self.scheduler_delay_factor,
             enable_chunked_prefill=self.enable_chunked_prefill,
