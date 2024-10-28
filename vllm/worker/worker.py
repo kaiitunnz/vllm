@@ -129,9 +129,9 @@ class Worker(LocalOrDistributedWorkerBase):
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                # with_stack=True,
+                with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
+                    torch_profiler_trace_dir, use_gzip=False))
         else:
             self.profiler = None
 
@@ -314,11 +314,20 @@ class Worker(LocalOrDistributedWorkerBase):
                                       device=self.device,
                                       dtype=torch.int64).view(-1, 2)
 
+        blocks_to_prefetch = torch.tensor(execute_model_req.blocks_to_prefetch,
+                                          device="cpu",
+                                          dtype=torch.int64).view(-1, 2)
+        blocks_to_unload = torch.tensor(execute_model_req.blocks_to_unload,
+                                        device="cpu",
+                                        dtype=torch.int64).view(-1, 2)
+
         return WorkerInput(
             num_seq_groups=num_seq_groups,
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
+            blocks_to_prefetch=blocks_to_prefetch,
+            blocks_to_unload=blocks_to_unload,
             virtual_engine=virtual_engine,
             num_steps=num_steps,
         )
@@ -338,6 +347,15 @@ class Worker(LocalOrDistributedWorkerBase):
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
+        if (worker_input.blocks_to_unload is not None
+                and worker_input.blocks_to_unload.numel() > 0):
+            self.cache_engine[virtual_engine].unload(
+                worker_input.blocks_to_unload)
+        if (worker_input.blocks_to_prefetch is not None
+                and worker_input.blocks_to_prefetch.numel() > 0):
+            self.cache_engine[virtual_engine].prefetch(
+                worker_input.blocks_to_prefetch)
+
         # Start asynchronous cache operations.
         self.cache_engine[virtual_engine].begin_cache_ops()
 
