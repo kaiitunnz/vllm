@@ -961,6 +961,7 @@ class SchedulerConfig:
                  max_model_len: int,
                  use_v2_block_manager: bool = True,
                  use_mt_block_manager: bool = False,
+                 enable_prefix_aware_scheduling: bool = False,
                  num_lookahead_slots: int = 0,
                  delay_factor: float = 0.0,
                  enable_chunked_prefill: bool = False,
@@ -1012,6 +1013,7 @@ class SchedulerConfig:
         self.max_model_len = max_model_len
         self.use_v2_block_manager = use_v2_block_manager
         self.use_mt_block_manager = use_mt_block_manager
+        self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         self.num_lookahead_slots = num_lookahead_slots
         self.delay_factor = delay_factor
         self.chunked_prefill_enabled = enable_chunked_prefill
@@ -1067,6 +1069,12 @@ class SchedulerConfig:
                 logger.info(
                     "Multi-tier block manager is enabled. Block manager v2 "
                     "will be used as a fallback.")
+        else:
+            if self.enable_prefix_aware_scheduling:
+                logger.warning(
+                    "Prefix-aware scheduling is not supported without "
+                    "multi-tier block manager, disable it.")
+                self.enable_prefix_aware_scheduling = False
 
     @property
     def is_multi_step(self) -> bool:

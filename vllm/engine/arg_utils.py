@@ -108,6 +108,7 @@ class EngineArgs:
     enable_prefix_caching: bool = False
     enable_multi_tier_prefix_caching: bool = False
     enable_async_swapping: bool = False
+    enable_prefix_aware_scheduling: bool = False
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
@@ -374,6 +375,9 @@ class EngineArgs:
         parser.add_argument('--enable-async-swapping',
                             action='store_true',
                             help='Enables asynchronous KV cache swapping.')
+        parser.add_argument('--enable-prefix-aware-scheduling',
+                            action='store_true',
+                            help='Enables prefix-aware scheduling.')
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '
@@ -927,8 +931,8 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
-            enable_multi_tier_prefix_caching=self.
-            enable_multi_tier_prefix_caching,
+            enable_multi_tier_prefix_caching=(
+                self.enable_multi_tier_prefix_caching),
             enable_async_swapping=self.enable_async_swapping,
             cpu_offload_gb=self.cpu_offload_gb,
         )
@@ -1040,6 +1044,7 @@ class EngineArgs:
             max_model_len=model_config.max_model_len,
             use_v2_block_manager=self.use_v2_block_manager,
             use_mt_block_manager=self.enable_multi_tier_prefix_caching,
+            enable_prefix_aware_scheduling=self.enable_prefix_aware_scheduling,
             num_lookahead_slots=num_lookahead_slots,
             delay_factor=self.scheduler_delay_factor,
             enable_chunked_prefill=self.enable_chunked_prefill,
