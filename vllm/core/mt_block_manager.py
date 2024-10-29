@@ -204,8 +204,9 @@ class SequenceMeta:
     def deallocate(self) -> None:
         # Destroy placeholder blocks.
         for block in self.full_blocks:
-            self._allocator.destroy(block)
-            assert block.state == BlockState.UNINIT
+            if block.state == BlockState.PLACEHOLDER:
+                self._allocator.destroy(block)
+                assert block.state == BlockState.UNINIT
 
 
 # class MTBlockSpaceManager(BlockSpaceManager):

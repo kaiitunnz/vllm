@@ -138,6 +138,9 @@ class MTWaitQueue(MTWaitQueueBase):
             return self._waiting.popleft()
 
         def _reset(self) -> None:
+            for seq_metas in self._seq_meta_cache.values():
+                for seq_meta in seq_metas:
+                    seq_meta.deallocate()
             self._seq_meta_cache.clear()
 
         def __bool__(self) -> bool:
@@ -265,6 +268,9 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
                 self._dispenser.append(seq_group)
 
         def _reset(self) -> None:
+            for seq_metas in self._seq_meta_cache.values():
+                for seq_meta in seq_metas:
+                    seq_meta.deallocate()
             self._seq_meta_cache.clear()
 
         def get(self, index: int) -> SequenceGroup:
