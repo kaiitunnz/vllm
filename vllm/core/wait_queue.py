@@ -286,9 +286,7 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
             for seq_group in self._dispenser:
                 seq_metas = self._seq_meta_cache.get(seq_group, None)
                 if seq_metas is None:
-                    seq_metas = self._block_manager.process_sequence_group(
-                        seq_group, status=PrefixAwareWaitQueue.STATUS)
-                    self._seq_meta_cache[seq_group] = seq_metas
+                    continue
                 prefetchable.append((seq_group, seq_metas))
             return prefetchable
 

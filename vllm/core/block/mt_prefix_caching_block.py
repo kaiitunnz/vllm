@@ -77,6 +77,12 @@ class PrefixCache:
         if self._block_ids is not None:
             assert block.block_id in self._block_ids
         return block
+    
+    def __getitem__(self, content_hash: PrefixHash) -> Block:
+        block = self._prefix_cache[content_hash]
+        if (self._block_ids is None) or (block.block_id in self._block_ids):
+            return block
+        raise KeyError(content_hash)
 
     def __contains__(self, key: PrefixHash) -> bool:
         return self.get(key) is not None
@@ -275,7 +281,13 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         assert block.state == BlockState.PLACEHOLDER
         assert block.content_hash is not None
         assert block.block_id is None
-        assert block.content_hash not in self._prefix_cache
+
+        if block.content_hash in self._prefix_cache:
+            # The block has been computed by another sequence.
+            # We can reuse the cached block.
+            cached_block = self._prefix_cache[block.content_hash]
+            self.destroy(block, keep_prefix_cache=True)
+            return self.allocate_cached_block(cached_block)
 
         self.metric_data.query(hit=False)
 

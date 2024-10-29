@@ -1,4 +1,5 @@
 """A block manager that manages token blocks."""
+import itertools
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Set, Tuple
@@ -28,6 +29,9 @@ class SequenceMeta:
                  allocator: MTDeviceAwareBlockAllocator):
         self._sequence = seq
         self._allocator = allocator
+        # Cache of content hashes of the `cached blocks`
+        self._content_hash_cache: List[int] = []
+        self._full_blocks: Optional[List[Block]]
         (
             self._cached_blocks,
             self._cached_blocks_to_move_in,
@@ -54,6 +58,8 @@ class SequenceMeta:
 
     @property
     def full_blocks(self):
+        if self._full_blocks is None:
+            raise ValueError("Full blocks have been invalidated.")
         return self._full_blocks
 
     @property
@@ -64,7 +70,8 @@ class SequenceMeta:
     def block_ids_in_use(self) -> Set[int]:
         return {
             block.block_id
-            for block in self._cached_blocks + self._cached_blocks_to_move_in
+            for block in itertools.chain(self._cached_blocks,
+                                         self._cached_blocks_to_move_in)
             if block.block_id is not None
         }
 
@@ -190,6 +197,32 @@ class SequenceMeta:
             tail_block_token_ids,
         )
 
+    def refresh_cached_blocks(self) -> None:
+        self._num_required_blocks = None
+
+        cached_blocks: List[Block] = []
+        cached_blocks_to_move_in: List[Block] = []
+
+        for content_hash in self._content_hash_cache:
+            cached_block = self._allocator.get_cached_block(content_hash)
+            if cached_block is None:
+                continue
+            if self._allocator.get_device_tier(cached_block) == 0:
+                cached_blocks.append(cached_block)
+            else:
+                cached_blocks_to_move_in.append(cached_block)
+
+        if self._full_blocks is not None:
+            # Deallocate the placeholder blocks.
+            for block in self._full_blocks:
+                if block.state == BlockState.PLACEHOLDER:
+                    self._allocator.destroy(block)
+            # Invalidate the full blocks
+            self._full_blocks = None
+
+        self._cached_blocks = cached_blocks
+        self._cached_blocks_to_move_in = cached_blocks_to_move_in
+
     def _get_cached_block(
             self, prev_block_hash: Optional[int],
             cur_block_token_ids: List[int]) -> Tuple[int, Optional[Block]]:
@@ -199,14 +232,19 @@ class SequenceMeta:
             cur_block_token_ids=cur_block_token_ids,
         )
         cached_block = self._allocator.get_cached_block(content_hash)
+        # Maintain the cache of content hashes of the cached blocks.
+        if cached_block is not None:
+            self._content_hash_cache.append(content_hash)
         return content_hash, cached_block
 
     def deallocate(self) -> None:
         # Destroy placeholder blocks.
-        for block in self.full_blocks:
-            if block.state == BlockState.PLACEHOLDER:
-                self._allocator.destroy(block)
-                assert block.state == BlockState.UNINIT
+        if self._full_blocks is not None:
+            for block in self._full_blocks:
+                if block.state == BlockState.PLACEHOLDER:
+                    self._allocator.destroy(block)
+                    assert block.state == BlockState.UNINIT
+            self._full_blocks = None  # Invalidate the full blocks
 
 
 # class MTBlockSpaceManager(BlockSpaceManager):

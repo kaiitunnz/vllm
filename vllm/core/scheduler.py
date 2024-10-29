@@ -1213,15 +1213,20 @@ class Scheduler:
             blocks_to_move_in, blocks_to_move_out = (
                 self._get_and_reset_blocks_to_move())
 
-        if self.scheduler_config.enable_async_prefetching:
-            # Try to prefetch blocks that are likely to be used in the next
-            # prefilling step.
-            with self.waiting as waiting_queue:
+            if self.scheduler_config.enable_async_prefetching:
+                # Try to prefetch blocks that are likely to be used in the next
+                # prefilling step.
                 prefetchable = waiting_queue.get_prefetchable()
-                block_ids_in_use = self.block_manager.get_block_ids_in_use([
+                seq_meta_list = [
                     seq_meta for _, seq_metas in prefetchable
                     for seq_meta in seq_metas
-                ])
+                ]
+                # Refresh the cached blocks as the allocation has already been
+                # performed.
+                for seq_meta in seq_meta_list:
+                        seq_meta.refresh_cached_blocks()
+                block_ids_in_use = self.block_manager.get_block_ids_in_use(
+                    seq_meta_list)
                 moved_in_blocks: List[Block] = []
                 num_usable_blocks: Optional[int] = None
                 for seq_group, seq_metas in prefetchable:
@@ -1239,9 +1244,9 @@ class Scheduler:
 
                 blocks_to_prefetch, blocks_to_unload = (
                     self._get_and_reset_blocks_to_move())
-        else:
-            blocks_to_prefetch = []
-            blocks_to_unload = []
+            else:
+                blocks_to_prefetch = []
+                blocks_to_unload = []
 
         # Queue requests that couldn't be scheduled.
         self.waiting.extendleft(leftover_waiting_sequences)
