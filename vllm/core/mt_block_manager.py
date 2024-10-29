@@ -1,6 +1,6 @@
 """A block manager that manages token blocks."""
 import itertools
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Set, Tuple
 
@@ -25,19 +25,67 @@ EncoderSeqId = str
 
 class SequenceMeta:
 
+    class CacheManager:
+
+        def __init__(self):
+            self.cached_blocks: List[Block] = []
+            self.cached_blocks_token_ids: List[List[int]] = []
+            self.cached_blocks_hashes: List[int] = []
+
+            self.cached_blocks_to_move_in: List[Block] = []
+            self.cached_blocks_to_move_in_token_ids: List[List[int]] = []
+            self.cached_blocks_to_move_in_hashes: List[int] = []
+
+            self.full_blocks: List[Block] = []
+
+        def add_cached_block(self, block: Block) -> None:
+            assert block.content_hash is not None
+            self.cached_blocks.append(block)
+            self.cached_blocks_token_ids.append(block.token_ids)
+            self.cached_blocks_hashes.append(block.content_hash)
+
+        def add_cached_block_to_move_in(self, block: Block) -> None:
+            assert block.content_hash is not None
+            self.cached_blocks_to_move_in.append(block)
+            self.cached_blocks_to_move_in_token_ids.append(block.token_ids)
+            self.cached_blocks_to_move_in_hashes.append(block.content_hash)
+
+        def add_full_block(self, block: Block) -> None:
+            assert block.content_hash is not None
+            self.full_blocks.append(block)
+
+        def iter_cached_blocks(self) -> Iterable[Tuple[List[int], int]]:
+            return zip(self.cached_blocks_token_ids, self.cached_blocks_hashes)
+
+        def iter_cached_blocks_to_move_in(
+                self) -> Iterable[Tuple[List[int], int]]:
+            return zip(self.cached_blocks_to_move_in_token_ids,
+                       self.cached_blocks_to_move_in_hashes)
+
+        def iter_all_cached_blocks(self) -> Iterable[Tuple[List[int], int]]:
+            return itertools.chain(self.iter_cached_blocks(),
+                                   self.iter_cached_blocks_to_move_in())
+
+        @property
+        def all_cached_blocks(self) -> Iterable[Block]:
+            return itertools.chain(self.cached_blocks,
+                                   self.cached_blocks_to_move_in)
+
+        def reset_cached_blocks(self) -> None:
+            self.cached_blocks = []
+            self.cached_blocks_token_ids = []
+            self.cached_blocks_hashes = []
+            self.cached_blocks_to_move_in = []
+            self.cached_blocks_to_move_in_token_ids = []
+            self.cached_blocks_to_move_in_hashes = []
+
     def __init__(self, seq: Sequence, block_size: int,
                  allocator: MTDeviceAwareBlockAllocator):
         self._sequence = seq
         self._allocator = allocator
-        # Cache of content hashes of the `cached blocks`
-        self._content_hash_cache: List[int] = []
-        self._full_blocks: Optional[List[Block]]
-        (
-            self._cached_blocks,
-            self._cached_blocks_to_move_in,
-            self._full_blocks,
-            self._tail_block_token_ids,
-        ) = self._split_sequence_tokens(seq.get_token_ids(), block_size)
+        self._manager = SequenceMeta.CacheManager()
+        self._tail_block_token_ids = self._init_cache_manager(
+            seq.get_token_ids(), block_size)
         self._num_required_blocks: Optional[int] = None
 
     @property
@@ -50,17 +98,15 @@ class SequenceMeta:
 
     @property
     def cached_blocks(self):
-        return self._cached_blocks
+        return self._manager.cached_blocks
 
     @property
     def cached_blocks_to_move_in(self):
-        return self._cached_blocks_to_move_in
+        return self._manager.cached_blocks_to_move_in
 
     @property
     def full_blocks(self):
-        if self._full_blocks is None:
-            raise ValueError("Full blocks have been invalidated.")
-        return self._full_blocks
+        return self._manager.full_blocks
 
     @property
     def tail_block_token_ids(self):
@@ -70,8 +116,7 @@ class SequenceMeta:
     def block_ids_in_use(self) -> Set[int]:
         return {
             block.block_id
-            for block in itertools.chain(self._cached_blocks,
-                                         self._cached_blocks_to_move_in)
+            for block in self._manager.all_cached_blocks
             if block.block_id is not None
         }
 
@@ -93,12 +138,12 @@ class SequenceMeta:
 
         cached_blocks_to_allocate: List[int] = []
         if allocated_evicted_blocks is None:
-            for block in self._cached_blocks:
+            for block in self.cached_blocks:
                 assert block.block_id is not None
                 if block.state == BlockState.FREED:
                     cached_blocks_to_allocate.append(block.block_id)
         else:
-            for block in self._cached_blocks:
+            for block in self.cached_blocks:
                 assert block.block_id is not None
                 if ((block.state == BlockState.FREED)
                         and (block.block_id not in allocated_evicted_blocks)):
@@ -113,20 +158,12 @@ class SequenceMeta:
                                      len(self.full_blocks) + num_tail_blocks)
         return self._num_required_blocks
 
-    def _split_sequence_tokens(
-        self, token_ids: List[int], block_size: int
-    ) -> Tuple[List[Block], List[Block], List[Block], List[int]]:
+    def _init_cache_manager(self, token_ids: List[int],
+                            block_size: int) -> List[int]:
         """
         Returns:
-            List[Block]: The blocks that are cached in the highest-tier device.
-            List[Block]: The blocks that are cached in lower-tier devices.
-            List[Block]: The blocks that are full but not cached.
             List[int]: The tail block.
         """
-        cached_blocks: List[Block] = []
-        cached_blocks_to_move_in: List[Block] = []
-        full_blocks: List[Block] = []
-
         block_token_ids: List[List[int]] = []
         tail_block_token_ids: List[int] = []
         for cur_token_ids in chunk_list(token_ids, block_size):
@@ -135,93 +172,80 @@ class SequenceMeta:
             else:
                 tail_block_token_ids = cur_token_ids
 
-        block_token_ids_iter = iter(block_token_ids)
-        content_hash = None
-        cached_block = None
-        prev_block = None
-        # Highest-tier device
-        while (cur_block_token_ids := next(block_token_ids_iter,
-                                           None)) is not None:
+        content_hash: Optional[int] = None
+        cached_block: Optional[Block] = None
+        prev_block: Optional[Block] = None
+        for cur_token_ids in block_token_ids:
             content_hash, cached_block = self._get_cached_block(
-                content_hash,
-                cur_block_token_ids,
-            )
+                content_hash, cur_token_ids)
             if cached_block is None:
-                placeholder_block = (
-                    self._allocator.allocate_placeholder_block(
-                        prev_block=prev_block,
-                        token_ids=cur_block_token_ids,
-                        content_hash=content_hash))
-                full_blocks.append(placeholder_block)
-                prev_block = placeholder_block
-                break
-            if self._allocator.get_device_tier(cached_block) > 0:
-                cached_blocks_to_move_in.append(cached_block)
-                prev_block = cached_block
-                break
-            cached_blocks.append(cached_block)
+                cached_block = self._allocator.allocate_placeholder_block(
+                    prev_block=prev_block,
+                    token_ids=cur_token_ids,
+                    content_hash=content_hash)
+                self._manager.add_full_block(cached_block)
+            elif self._allocator.get_device_tier(cached_block) == 0:
+                self._manager.add_cached_block(cached_block)
+            else:
+                self._manager.add_cached_block_to_move_in(cached_block)
             prev_block = cached_block
 
-        # Lower-tier devices
-        if cached_block is not None:
-            while (cur_block_token_ids := next(block_token_ids_iter,
-                                               None)) is not None:
-                content_hash, cached_block = self._get_cached_block(
-                    content_hash,
-                    cur_block_token_ids,
-                )
-                if cached_block is None:
-                    placeholder_block = (
-                        self._allocator.allocate_placeholder_block(
-                            prev_block=prev_block,
-                            token_ids=cur_block_token_ids,
-                            content_hash=content_hash))
-                    full_blocks.append(placeholder_block)
-                    prev_block = placeholder_block
-                    break
-                cached_blocks_to_move_in.append(cached_block)
-                prev_block = cached_block
+        return tail_block_token_ids
 
-        # Uncached blocks
-        while (cur_block_token_ids := next(block_token_ids_iter,
-                                           None)) is not None:
-            placeholder_block = self._allocator.allocate_placeholder_block(
-                prev_block=prev_block, token_ids=cur_block_token_ids)
-            full_blocks.append(placeholder_block)
-            prev_block = placeholder_block
+    def recompute(self) -> None:
+        new_manager = SequenceMeta.CacheManager()
 
-        return (
-            cached_blocks,
-            cached_blocks_to_move_in,
-            full_blocks,
-            tail_block_token_ids,
-        )
+        prev_block: Optional[Block] = None
+        for cur_token_ids, content_hash in (
+                self._manager.iter_all_cached_blocks()):
+            cached_block = self._allocator.get_cached_block(content_hash)
+            if cached_block is None:
+                cached_block = self._allocator.allocate_placeholder_block(
+                    prev_block=prev_block,
+                    token_ids=cur_token_ids,
+                    content_hash=content_hash)
+                new_manager.add_full_block(cached_block)
+            elif self._allocator.get_device_tier(cached_block) == 0:
+                new_manager.add_cached_block(cached_block)
+            else:
+                new_manager.add_cached_block_to_move_in(cached_block)
+            prev_block = cached_block
+
+        for placeholder_block in self.full_blocks:
+            assert placeholder_block.state == BlockState.PLACEHOLDER
+            assert placeholder_block.content_hash is not None
+            cached_block = self._allocator.get_cached_block(
+                placeholder_block.content_hash)
+            if cached_block is None:
+                new_manager.add_full_block(placeholder_block)
+                continue
+            if self._allocator.get_device_tier(cached_block) == 0:
+                new_manager.add_cached_block(cached_block)
+            else:
+                new_manager.add_cached_block_to_move_in(cached_block)
+            self._allocator.destroy(placeholder_block)
+
+        self._manager = new_manager
 
     def refresh_cached_blocks(self) -> None:
         self._num_required_blocks = None
+        cache_iter = self._manager.iter_all_cached_blocks()
+        self._manager.reset_cached_blocks()
 
-        cached_blocks: List[Block] = []
-        cached_blocks_to_move_in: List[Block] = []
-
-        for content_hash in self._content_hash_cache:
+        prev_block: Optional[Block] = None
+        for cur_token_ids, content_hash in cache_iter:
             cached_block = self._allocator.get_cached_block(content_hash)
             if cached_block is None:
-                continue
-            if self._allocator.get_device_tier(cached_block) == 0:
-                cached_blocks.append(cached_block)
+                cached_block = self._allocator.allocate_placeholder_block(
+                    prev_block=prev_block,
+                    token_ids=cur_token_ids,
+                    content_hash=content_hash)
+                self._manager.add_full_block(cached_block)
+            elif self._allocator.get_device_tier(cached_block) == 0:
+                self._manager.add_cached_block(cached_block)
             else:
-                cached_blocks_to_move_in.append(cached_block)
-
-        if self._full_blocks is not None:
-            # Deallocate the placeholder blocks.
-            for block in self._full_blocks:
-                if block.state == BlockState.PLACEHOLDER:
-                    self._allocator.destroy(block)
-            # Invalidate the full blocks
-            self._full_blocks = None
-
-        self._cached_blocks = cached_blocks
-        self._cached_blocks_to_move_in = cached_blocks_to_move_in
+                self._manager.add_cached_block_to_move_in(cached_block)
+            prev_block = cached_block
 
     def _get_cached_block(
             self, prev_block_hash: Optional[int],
@@ -232,19 +256,14 @@ class SequenceMeta:
             cur_block_token_ids=cur_block_token_ids,
         )
         cached_block = self._allocator.get_cached_block(content_hash)
-        # Maintain the cache of content hashes of the cached blocks.
-        if cached_block is not None:
-            self._content_hash_cache.append(content_hash)
         return content_hash, cached_block
 
     def deallocate(self) -> None:
         # Destroy placeholder blocks.
-        if self._full_blocks is not None:
-            for block in self._full_blocks:
-                if block.state == BlockState.PLACEHOLDER:
-                    self._allocator.destroy(block)
-                    assert block.state == BlockState.UNINIT
-            self._full_blocks = None  # Invalidate the full blocks
+        for block in self.full_blocks:
+            if block.state == BlockState.PLACEHOLDER:
+                self._allocator.destroy(block)
+                assert block.state == BlockState.UNINIT
 
 
 # class MTBlockSpaceManager(BlockSpaceManager):

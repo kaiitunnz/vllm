@@ -98,6 +98,10 @@ class MTWaitQueueBase(WaitQueueBase):
             pass
 
         @abstractmethod
+        def extendleft(self, items: Iterable["MTWaitQueueBase.Item"]) -> None:
+            pass
+
+        @abstractmethod
         def __bool__(self) -> bool:
             pass
 
@@ -135,7 +139,15 @@ class MTWaitQueue(MTWaitQueueBase):
             return seq_group, seq_metas
 
         def popleft(self) -> SequenceGroup:
-            return self._waiting.popleft()
+            seq_group = self._waiting.popleft()
+            # Should always peekleft before popleft.
+            del self._seq_meta_cache[seq_group]
+            return seq_group
+
+        def extendleft(self, items: Iterable["MTWaitQueue.Item"]) -> None:
+            for seq_group, seq_metas in items:
+                self._waiting.appendleft(seq_group)
+                self._seq_meta_cache[seq_group] = seq_metas
 
         def _reset(self) -> None:
             for seq_metas in self._seq_meta_cache.values():
@@ -231,7 +243,16 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
             return seq_group, seq_metas
 
         def popleft(self) -> SequenceGroup:
-            return self._dispenser.popleft()
+            seq_group = self._dispenser.popleft()
+            # Should always peekleft before popleft.
+            del self._seq_meta_cache[seq_group]
+            return seq_group
+
+        def extendleft(self,
+                       items: Iterable["PrefixAwareWaitQueue.Item"]) -> None:
+            for seq_group, seq_metas in items:
+                self._dispenser.appendleft(seq_group)
+                self._seq_meta_cache[seq_group] = seq_metas
 
         def _process_and_sort(
             self, seq_groups: Iterable[SequenceGroup]
@@ -267,11 +288,11 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
                 self._seq_meta_cache[seq_group] = seq_metas
                 self._dispenser.append(seq_group)
 
-        def _reset(self) -> None:
+        def _recompute(self) -> None:
+            assert len(self._dispenser) >= len(self._seq_meta_cache)
             for seq_metas in self._seq_meta_cache.values():
                 for seq_meta in seq_metas:
-                    seq_meta.deallocate()
-            self._seq_meta_cache.clear()
+                    seq_meta.recompute()
 
         def get(self, index: int) -> SequenceGroup:
             while index >= len(self._dispenser):
@@ -343,8 +364,8 @@ class PrefixAwareWaitQueue(MTWaitQueueBase):
         return itertools.chain(self._dispenser, self._waiting)
 
     def __enter__(self):
-        self._context_manager._reset()
+        self._context_manager._recompute()
         return self._context_manager
 
     def __exit__(self, type, value, traceback) -> None:
-        self._context_manager._reset()
+        pass

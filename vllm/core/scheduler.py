@@ -1062,7 +1062,7 @@ class Scheduler:
         seq_groups: List[ScheduledSequenceGroup] = []
 
         # Try allocating
-        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+        leftover_waiting_sequences: Deque[PrefixAwareWaitQueue.Item] = deque()
         seq_groups_to_allocate: List[SequenceGroup] = []
         seq_metas_to_allocate: List[List[SequenceMeta]] = []
         num_allocated_blocks = 0
@@ -1098,6 +1098,8 @@ class Scheduler:
                         seq.status = SequenceStatus.FINISHED_IGNORED
                     ignored_seq_groups.append(seq_group)
                     waiting_queue.popleft()
+                    for seq_meta in seq_metas:
+                        seq_meta.deallocate()
                     continue
 
                 num_lookahead_slots: int = 0
@@ -1115,7 +1117,8 @@ class Scheduler:
                             and len(curr_loras) >= self.lora_config.max_loras):
                         # We don't have a space for another LoRA, so
                         # we ignore this request for now.
-                        leftover_waiting_sequences.appendleft(seq_group)
+                        leftover_waiting_sequences.appendleft(
+                            (seq_group, seq_metas))
                         waiting_queue.popleft()
                         continue
 
@@ -1135,9 +1138,6 @@ class Scheduler:
                     allocated_evicted_blocks=allocated_evicted_blocks,
                 )
                 if can_allocate != AllocStatus.OK:
-                    # Deallocate placeholder blocks held by seq_metas.
-                    for seq_meta in seq_metas:
-                        seq_meta.deallocate()
                     if can_allocate == AllocStatus.LATER:
                         break
                     elif can_allocate == AllocStatus.NEVER:
@@ -1150,6 +1150,8 @@ class Scheduler:
                             seq.status = SequenceStatus.FINISHED_IGNORED
                         ignored_seq_groups.append(seq_group)
                         waiting_queue.popleft()
+                        for seq_meta in seq_metas:
+                            seq_meta.deallocate()
                         continue
 
                 # Allocate
@@ -1224,7 +1226,7 @@ class Scheduler:
                 # Refresh the cached blocks as the allocation has already been
                 # performed.
                 for seq_meta in seq_meta_list:
-                        seq_meta.refresh_cached_blocks()
+                    seq_meta.refresh_cached_blocks()
                 block_ids_in_use = self.block_manager.get_block_ids_in_use(
                     seq_meta_list)
                 moved_in_blocks: List[Block] = []
@@ -1248,8 +1250,9 @@ class Scheduler:
                 blocks_to_prefetch = []
                 blocks_to_unload = []
 
-        # Queue requests that couldn't be scheduled.
-        self.waiting.extendleft(leftover_waiting_sequences)
+            # Queue requests that couldn't be scheduled.
+            waiting_queue.extendleft(leftover_waiting_sequences)
+
         if len(seq_groups) > 0:
             self.prev_prompt = True
 
