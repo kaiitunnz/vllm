@@ -20,7 +20,7 @@ class EvictedBlockMetaData:
     """Data structure for storing key data describe evicted block, that the 
     evictor uses to decide which block to evict.
     """
-    __slots__ = ("block", "last_accessed", "hit_count")
+    __slots__ = ("block", "last_accessed", "hit_count", "num_hashed_tokens")
 
     def __init__(self,
                  block: "Block",
@@ -29,10 +29,7 @@ class EvictedBlockMetaData:
         self.block = block
         self.last_accessed = last_accessed
         self.hit_count = hit_count
-
-    @property
-    def num_hashed_tokens(self) -> int:
-        return self.block.num_tokens_total
+        self.num_hashed_tokens = block.num_tokens_total
 
 
 class AllocationOutput:
