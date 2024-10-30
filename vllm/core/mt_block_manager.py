@@ -38,17 +38,18 @@ class SequenceMeta:
 
             self.full_blocks: List[Block] = []
 
-        def add_cached_block(self, block: Block) -> None:
-            assert block.content_hash is not None
+        def add_cached_block(self, block: Block, token_ids: List[int],
+                             content_hash: int) -> None:
             self.cached_blocks.append(block)
-            self.cached_blocks_token_ids.append(block.token_ids)
-            self.cached_blocks_hashes.append(block.content_hash)
+            self.cached_blocks_token_ids.append(token_ids)
+            self.cached_blocks_hashes.append(content_hash)
 
-        def add_cached_block_to_move_in(self, block: Block) -> None:
-            assert block.content_hash is not None
+        def add_cached_block_to_move_in(self, block: Block,
+                                        token_ids: List[int],
+                                        content_hash: int) -> None:
             self.cached_blocks_to_move_in.append(block)
-            self.cached_blocks_to_move_in_token_ids.append(block.token_ids)
-            self.cached_blocks_to_move_in_hashes.append(block.content_hash)
+            self.cached_blocks_to_move_in_token_ids.append(token_ids)
+            self.cached_blocks_to_move_in_hashes.append(content_hash)
 
         def add_full_block(self, block: Block) -> None:
             assert block.content_hash is not None
@@ -185,9 +186,11 @@ class SequenceMeta:
                     content_hash=content_hash)
                 self._manager.add_full_block(cached_block)
             elif self._allocator.get_device_tier(cached_block) == 0:
-                self._manager.add_cached_block(cached_block)
+                self._manager.add_cached_block(cached_block, cur_token_ids,
+                                               content_hash)
             else:
-                self._manager.add_cached_block_to_move_in(cached_block)
+                self._manager.add_cached_block_to_move_in(
+                    cached_block, cur_token_ids, content_hash)
             prev_block = cached_block
 
         return tail_block_token_ids
@@ -206,9 +209,11 @@ class SequenceMeta:
                     content_hash=content_hash)
                 new_manager.add_full_block(cached_block)
             elif self._allocator.get_device_tier(cached_block) == 0:
-                new_manager.add_cached_block(cached_block)
+                new_manager.add_cached_block(cached_block, cur_token_ids,
+                                             content_hash)
             else:
-                new_manager.add_cached_block_to_move_in(cached_block)
+                new_manager.add_cached_block_to_move_in(
+                    cached_block, cur_token_ids, content_hash)
             prev_block = cached_block
 
         for placeholder_block in self.full_blocks:
@@ -220,9 +225,11 @@ class SequenceMeta:
                 new_manager.add_full_block(placeholder_block)
                 continue
             if self._allocator.get_device_tier(cached_block) == 0:
-                new_manager.add_cached_block(cached_block)
+                new_manager.add_cached_block(cached_block, cur_token_ids,
+                                             content_hash)
             else:
-                new_manager.add_cached_block_to_move_in(cached_block)
+                new_manager.add_cached_block_to_move_in(
+                    cached_block, cur_token_ids, content_hash)
             self._allocator.destroy(placeholder_block)
 
         self._manager = new_manager
@@ -242,9 +249,11 @@ class SequenceMeta:
                     content_hash=content_hash)
                 self._manager.add_full_block(cached_block)
             elif self._allocator.get_device_tier(cached_block) == 0:
-                self._manager.add_cached_block(cached_block)
+                self._manager.add_cached_block(cached_block, cur_token_ids,
+                                               content_hash)
             else:
-                self._manager.add_cached_block_to_move_in(cached_block)
+                self._manager.add_cached_block_to_move_in(
+                    cached_block, cur_token_ids, content_hash)
             prev_block = cached_block
 
     def _get_cached_block(

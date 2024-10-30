@@ -182,10 +182,13 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
 
         self._block_ids_to_allocator: Dict[int, MTBlockAllocator] = {}
         self._block_ids_to_device: Dict[int, Device] = {}
+        self._block_ids_to_device_tier: Dict[int, int] = {}
         for device, allocator in self._allocators.items():
             for block_id in allocator.all_block_ids:
                 self._block_ids_to_allocator[block_id] = allocator
                 self._block_ids_to_device[block_id] = device
+                self._block_ids_to_device_tier[block_id] = (
+                    self._device_tier.index(device))
 
     def allocate_or_get_null_block(self) -> Block:
         if self._null_block is None:
@@ -489,10 +492,11 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
         return self._block_ids_to_device[block_id]
 
     def get_device_tier(self, block: Block) -> int:
-        return self._device_tier.index(self.get_device(block))
+        assert block.block_id is not None
+        return self._block_ids_to_device_tier[block.block_id]
 
     def get_device_tier_from_id(self, block_id: int) -> int:
-        return self._device_tier.index(self.get_device_from_id(block_id))
+        return self._block_ids_to_device_tier[block_id]
 
     def get_num_full_blocks_touched(self, blocks: List[Block],
                                     device: Device) -> int:
