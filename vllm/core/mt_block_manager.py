@@ -225,11 +225,12 @@ class SequenceMeta:
                 new_manager.add_full_block(placeholder_block)
                 continue
             if self._allocator.get_device_tier(cached_block) == 0:
-                new_manager.add_cached_block(cached_block, cur_token_ids,
+                new_manager.add_cached_block(cached_block,
+                                             cached_block.token_ids,
                                              content_hash)
             else:
                 new_manager.add_cached_block_to_move_in(
-                    cached_block, cur_token_ids, content_hash)
+                    cached_block, cached_block.token_ids, content_hash)
             self._allocator.destroy(placeholder_block)
 
         self._manager = new_manager
