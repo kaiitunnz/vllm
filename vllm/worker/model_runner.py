@@ -49,7 +49,7 @@ from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.utils import (DeviceMemoryProfiler, PyObjectCache, async_tensor_h2d,
                         flatten_2d_lists, is_hip, is_pin_memory_available,
                         supports_dynamo)
-from vllm.worker.cache_engine import SwapManager
+from vllm.worker.cache_engine import SwapManagerBase
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
     _add_attn_metadata_broadcastable_dict,
@@ -1598,7 +1598,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         model_input: ModelInputForGPUWithSamplingMetadata,
         kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
-        swap_manager: Optional[SwapManager] = None,
+        swap_manager: Optional[SwapManagerBase] = None,
         num_steps: int = 1,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
         if num_steps > 1:

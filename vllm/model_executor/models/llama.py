@@ -49,7 +49,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import is_hip
-from vllm.worker.cache_engine import SwapManager
+from vllm.worker.cache_engine import SwapManagerBase
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (PPMissingLayer, is_pp_missing_parameter,
@@ -321,7 +321,7 @@ class LlamaModel(nn.Module):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
-        swap_manager: Optional[SwapManager] = None,
+        swap_manager: Optional[SwapManagerBase] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -450,7 +450,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
-        swap_manager: Optional[SwapManager] = None,
+        swap_manager: Optional[SwapManagerBase] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(input_ids,
                                   positions,

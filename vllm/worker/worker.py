@@ -24,7 +24,8 @@ from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
-from vllm.worker.cache_engine import CacheEngine
+from vllm.worker.cache_engine import (CacheEngine, create_cache_engine,
+                                      get_cache_block_size)
 from vllm.worker.embedding_model_runner import EmbeddingModelRunner
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
@@ -269,8 +270,8 @@ class Worker(LocalOrDistributedWorkerBase):
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
-            CacheEngine.from_config(self.cache_config, self.model_config,
-                                    self.parallel_config, self.device_config)
+            create_cache_engine(self.cache_config, self.model_config,
+                                self.parallel_config, self.device_config)
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
         self.gpu_cache = [
@@ -515,9 +516,8 @@ class Worker(LocalOrDistributedWorkerBase):
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        return CacheEngine.get_cache_block_size(self.cache_config,
-                                                self.model_config,
-                                                self.parallel_config)
+        return get_cache_block_size(self.cache_config, self.model_config,
+                                    self.parallel_config)
 
 
 def init_worker_distributed_environment(
