@@ -1,8 +1,8 @@
 from os.path import commonprefix
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
-from vllm.core.block.common import (BlockPool, CacheMetricData,
-                                    CopyOnWriteTracker,
+from vllm.core.block.common import (BlockPool, CopyOnWriteTracker,
+                                    DeviceCacheMetricData,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
                                         BlockState, Device,
@@ -77,7 +77,7 @@ class PrefixCache:
         if self._block_ids is not None:
             assert block.block_id in self._block_ids
         return block
-    
+
     def __getitem__(self, content_hash: PrefixHash) -> Block:
         block = self._prefix_cache[content_hash]
         if (self._block_ids is None) or (block.block_id in self._block_ids):
@@ -118,6 +118,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         self,
         num_blocks: int,
         block_size: int,
+        metric_data: DeviceCacheMetricData,
         block_ids: Optional[Iterable[int]] = None,
         prefix_cache: Optional[PrefixCache] = None,
         block_pool: Optional[BlockPool] = None,
@@ -181,7 +182,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         self._cow_tracker = CopyOnWriteTracker(
             refcounter=self._refcounter.as_readonly())
 
-        self.metric_data = CacheMetricData()
+        self.metric_data = metric_data
 
     # Implements Block.Factory.
     def _create_block(
@@ -844,7 +845,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
     def swap_in(self, blocks: List[Block]) -> None:
         raise NotImplementedError("Swap in is not supported.")
 
-    def move_out(self, block: Block) -> None:
+    def move_out(self, block: Block, cache_hit: bool = False) -> None:
         assert ((block.state == BlockState.FREED)
                 or (block.state == BlockState.EVICTED))
         assert block.content_hash is not None
@@ -858,6 +859,9 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             # in the evictor.
             self.evictor.remove(block_id)
             self._hashless_allocator.free_block_id(block_id)
+
+        if cache_hit:
+            self.metric_data.query(hit=True)
 
         block.block_id = None
         block.set_state(BlockState.EVICTED)

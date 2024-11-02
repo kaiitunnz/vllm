@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Deque, Dict, Iterable, List, Optional, Protocol, Tuple
 
 from vllm.core.block.interfaces import Block, BlockAllocator, BlockState
+from vllm.utils import Device
 
 BlockId = int
 RefCount = int
@@ -363,6 +364,87 @@ class CacheMetricData:
                                     self.num_incompleted_block_queries)
             incompleted_block_hit = (incompleted_hit_rate * incomplete_ratio)
         return (completed_block_hit + incompleted_block_hit) / total_blocks
+
+
+class DeviceCacheMetricData:
+    __slots__ = "mt_metric_data", "device"
+
+    def __init__(self, mt_metric_data: "MTCacheMetricData", device: Device):
+        self.mt_metric_data = mt_metric_data
+        self.device = device
+
+    def query(self, hit: bool) -> None:
+        self.mt_metric_data.query(hit, self.device)
+
+    def get_hit_rate(self) -> float:
+        return self.mt_metric_data.get_hit_rate(self.device)
+
+
+class MTCacheMetricData:
+    """This class is used to maintain cache metric for multi-tier KV cache.
+
+    It should be shared among all the cache layers in the multi-tier cache.
+    """
+
+    class DeviceData:
+        __slots__ = ("completed_block_cache_hit_rate",
+                     "num_incompleted_block_hit")
+
+        def __init__(self):
+            self.completed_block_cache_hit_rate: float = 0.0
+            self.num_incompleted_block_hit: int = 0
+
+    def __init__(self, devices: List[Device]):
+        self.num_completed_blocks: int = 0
+        self.num_incompleted_block_queries: int = 0
+        self.device_data: Dict[Device, MTCacheMetricData.DeviceData] = {
+            device: MTCacheMetricData.DeviceData()
+            for device in devices
+        }
+        self.block_size: int = 1000
+
+    def query(self, hit: bool, device: Device):
+        self.num_incompleted_block_queries += 1
+
+        # Update the hit count for this device
+        this_device_data = self.device_data[device]
+        this_device_data.num_incompleted_block_hit += 1 if hit else 0
+
+        # When a block is completed, update the cache hit rate
+        # and reset the incomplete numbers of each device.
+        if self.num_incompleted_block_queries == self.block_size:
+            for device, data in self.device_data.items():
+                hit_rate = (data.num_incompleted_block_hit /
+                            self.num_incompleted_block_queries)
+                data.completed_block_cache_hit_rate = (
+                    data.completed_block_cache_hit_rate *
+                    self.num_completed_blocks +
+                    hit_rate) / (self.num_completed_blocks + 1)
+                data.num_incompleted_block_hit = 0
+            self.num_incompleted_block_queries = 0
+            self.num_completed_blocks += 1
+
+    def get_hit_rate(self, device: Device):
+        incomplete_ratio = self.num_incompleted_block_queries / self.block_size
+        total_blocks = self.num_completed_blocks + incomplete_ratio
+        if total_blocks == 0:
+            return 0.0
+
+        this_device_data = self.device_data[device]
+        completed_block_hit, incompleted_block_hit = 0.0, 0.0
+        if self.num_completed_blocks > 0:
+            completed_block_hit = (
+                this_device_data.completed_block_cache_hit_rate *
+                self.num_completed_blocks)
+        if self.num_incompleted_block_queries > 0:
+            incompleted_hit_rate = (
+                this_device_data.num_incompleted_block_hit /
+                self.num_incompleted_block_queries)
+            incompleted_block_hit = (incompleted_hit_rate * incomplete_ratio)
+        return (completed_block_hit + incompleted_block_hit) / total_blocks
+
+    def for_device(self, device: Device) -> DeviceCacheMetricData:
+        return DeviceCacheMetricData(self, device)
 
 
 def get_all_blocks_recursively(last_block: Block) -> List[Block]:

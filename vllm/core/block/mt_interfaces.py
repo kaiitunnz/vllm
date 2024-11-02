@@ -78,7 +78,7 @@ class MTBlockAllocator(BlockAllocator):
         pass
 
     @abstractmethod
-    def move_out(self, block: Block) -> None:
+    def move_out(self, block: Block, cache_hit: bool = False) -> None:
         pass
 
     @abstractmethod

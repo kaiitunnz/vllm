@@ -1,6 +1,7 @@
 from logging import Logger
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
+from vllm.core.block.common import MTCacheMetricData
 from vllm.core.block.interfaces import (Block, BlockId, BlockState,
                                         EvictedBlockMetaData)
 from vllm.core.block.mt_interfaces import (MTAllocationOutput,
@@ -132,10 +133,13 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
 
         prefix_cache = PrefixCache()
 
+        metric_data = MTCacheMetricData([Device.GPU, Device.CPU])
+
         if allocator_type == "prefix_caching":
             gpu_allocator = MTPrefixCachingBlockAllocator(
                 num_blocks=num_gpu_blocks,
                 block_size=block_size,
+                metric_data=metric_data.for_device(Device.GPU),
                 block_ids=gpu_block_ids,
                 hit_count_threshold=1,
                 prefix_cache=prefix_cache,
@@ -144,6 +148,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
             cpu_allocator = MTPrefixCachingBlockAllocator(
                 num_blocks=num_cpu_blocks,
                 block_size=block_size,
+                metric_data=metric_data.for_device(Device.CPU),
                 block_ids=cpu_block_ids,
                 prefix_cache=prefix_cache,
                 hit_count_threshold=10,
@@ -375,7 +380,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
             self._block_mover.move((src_device, src_block_id), None)
             return None
 
-        self._allocators[src_device].move_out(block)
+        self._allocators[src_device].move_out(block, cache_hit=not evictable)
         alloc = self._allocators[dst_device].move_in(
             block,
             hit_count=hit_count,
