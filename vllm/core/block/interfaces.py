@@ -1,4 +1,5 @@
 import enum
+import sys
 from abc import ABC, abstractmethod
 from typing import Dict, FrozenSet, List, Optional, Protocol, Sequence, Tuple
 
@@ -45,8 +46,6 @@ class AllocationOutput:
 class Block(ABC):
 
     def init_block_state(self) -> None:
-        # TODO(noppanat): remove this
-        self._trace: List[Tuple[BlockState, Optional[BlockId]]] = []
         self.set_state(BlockState.UNINIT)
 
     @property
@@ -56,8 +55,6 @@ class Block(ABC):
 
     def set_state(self, state: BlockState) -> None:
         self._state = state
-        self._trace.append(
-            (state, self.block_id))  # TODO(noppanat): remove this
 
     @abstractmethod
     def append_token_ids(self, token_ids: List[int]) -> None:
