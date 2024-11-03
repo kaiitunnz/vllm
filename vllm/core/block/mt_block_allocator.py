@@ -421,6 +421,9 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
             assert block.content_hash in self._prefix_cache
 
             src_device = self.get_device(block)
+            if src_device == dst_device:
+                # The block has already been moved in by other sequences.
+                continue
             # Reset the hit count when moving in the top-tier device.
             evicted_meta = self._move(block,
                                       src_device,
