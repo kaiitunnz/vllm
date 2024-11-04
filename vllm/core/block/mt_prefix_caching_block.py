@@ -1,3 +1,4 @@
+import time
 from os.path import commonprefix
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
@@ -123,6 +124,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         prefix_cache: Optional[PrefixCache] = None,
         block_pool: Optional[BlockPool] = None,
         hit_count_threshold: int = 1,
+        cached_block_ttl: float = float("inf"),
         eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
     ):
         if block_ids is None:
@@ -130,6 +132,7 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
 
         self._block_size = block_size
         self._hit_count_threshold = hit_count_threshold
+        self._cached_block_ttl = cached_block_ttl
 
         # A list of immutable block IDs that have been touched by scheduler
         # and should be marked as computed after an entire batch of sequences
@@ -508,6 +511,13 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
                 self.destroy(evicted_block, keep_prefix_cache=False)
                 evicted_meta = None
 
+            if evicted_meta is not None and (
+                    time.time() - evicted_meta.last_accessed >
+                    self._cached_block_ttl):
+                # Destroy the block if the TTL is exceeded.
+                self.destroy(evicted_block, keep_prefix_cache=False)
+                evicted_meta = None
+
         # assert _block_id is not None
         assert self._refcounter.get(block_id) == 0
 
@@ -865,8 +875,17 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         if block_id in self.evictor:
             # In case of moving out of lower-tier devices where all blocks are
             # in the evictor.
-            self.evictor.remove(block_id)
+            evicted_meta = self.evictor.remove(block_id)
             self._hashless_allocator.free_block_id(block_id)
+
+            if (time.time() - evicted_meta.last_accessed >
+                    self._cached_block_ttl):
+                # If TTL is exceeded, convert it to a placeholder block.
+                assert block.content_hash is not None
+                self._prefix_cache.pop(block.content_hash)
+                block.block_id = None
+                block.set_state(BlockState.PLACEHOLDER)
+                return
 
         if cache_hit:
             self.metric_data.query(hit=True)
@@ -880,6 +899,11 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             hit_count: int = 0,
             evictable: bool = False,
             block_ids_in_use: Optional[Set[int]] = None) -> MTAllocationOutput:
+        if block.state == BlockState.PLACEHOLDER:
+            # The block has been destroyed and needs to be recomputed.
+            alloc = self.promote_placeholder_block(block, block_ids_in_use)
+            return alloc
+
         assert block.state == BlockState.EVICTED
         assert block.content_hash is not None
 

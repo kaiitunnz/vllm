@@ -142,6 +142,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
                 metric_data=metric_data.for_device(Device.GPU),
                 block_ids=gpu_block_ids,
                 hit_count_threshold=1,
+                cached_block_ttl=30.0,
                 prefix_cache=prefix_cache,
             )
 
@@ -152,6 +153,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
                 block_ids=cpu_block_ids,
                 prefix_cache=prefix_cache,
                 hit_count_threshold=10,
+                cached_block_ttl=30.0,
                 block_pool=gpu_allocator.block_pool,
             )
         else:
