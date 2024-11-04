@@ -962,6 +962,7 @@ class SchedulerConfig:
                  use_v2_block_manager: bool = True,
                  use_mt_block_manager: bool = False,
                  enable_prefix_aware_scheduling: bool = False,
+                 scheduler_window_size: Optional[int] = None,
                  enable_async_prefetching: bool = False,
                  num_lookahead_slots: int = 0,
                  delay_factor: float = 0.0,
@@ -1015,6 +1016,7 @@ class SchedulerConfig:
         self.use_v2_block_manager = use_v2_block_manager
         self.use_mt_block_manager = use_mt_block_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
+        self.scheduler_window_size = scheduler_window_size
         self.enable_async_prefetching = enable_async_prefetching
         self.num_lookahead_slots = num_lookahead_slots
         self.delay_factor = delay_factor
@@ -1082,6 +1084,11 @@ class SchedulerConfig:
                     "Asynchronous prefetching is not supported without "
                     "multi-tier block manager, disable it.")
                 self.enable_async_prefetching = False
+
+        if not self.enable_prefix_aware_scheduling:
+            logger.warning("Prefix-aware scheduling is disabled. Scheduler "
+                           "window size will be ignored.")
+            self.scheduler_window_size = None
 
     @property
     def is_multi_step(self) -> bool:
