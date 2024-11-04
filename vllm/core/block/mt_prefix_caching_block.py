@@ -433,9 +433,14 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         to_swap_out: List[BlockId]
             The list of block ids that need to be swapped out.
         """
-        hashless_block_id = self._maybe_allocate_hashless_block_id()
-        if hashless_block_id is not None:
-            return hashless_block_id, None
+        try:
+            hashless_block_id = self._maybe_allocate_hashless_block_id(
+                block_ids_in_use)
+            if hashless_block_id is not None:
+                return hashless_block_id, None
+        except MTBlockAllocator.NoUnusedBlocksError:
+            # In case all blocks are in use, we need to evict a block.
+            pass
 
         alloc = self._maybe_allocate_evicted_block_id(block_ids_in_use)
         if alloc is not None:
@@ -444,11 +449,14 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         # No block available in hashless allocator, nor in unused cache blocks.
         raise MTBlockAllocator.NoFreeBlocksError()
 
-    def _maybe_allocate_hashless_block_id(self) -> Optional[BlockId]:
+    def _maybe_allocate_hashless_block_id(
+            self,
+            block_ids_in_use: Optional[Set[BlockId]] = None
+    ) -> Optional[BlockId]:
         try:
             # Allocate mutable block and extract its block_id
             alloc = self._hashless_allocator.allocate_mutable_block(
-                prev_block=None)
+                prev_block=None, block_ids_in_use=block_ids_in_use)
             block_id = alloc.block.block_id
             self._hashless_allocator._block_pool.free_block(alloc.block)
 

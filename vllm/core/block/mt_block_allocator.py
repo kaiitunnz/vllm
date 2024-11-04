@@ -424,7 +424,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
             if src_device == dst_device:
                 # The block has already been moved in by other sequences.
                 # Must be done to increment the ref count.
-                self._allocators[src_device].allocate_cached_block(block)
+                self._allocators[dst_device].allocate_cached_block(block)
                 continue
             # Reset the hit count when moving in the top-tier device.
             evicted_meta = self._move(block,

@@ -1,5 +1,4 @@
 import enum
-import sys
 from abc import ABC, abstractmethod
 from typing import Dict, FrozenSet, List, Optional, Protocol, Sequence, Tuple
 
@@ -243,6 +242,9 @@ class BlockAllocator(ABC):
         pass
 
     class NoFreeBlocksError(ValueError):
+        pass
+
+    class NoUnusedBlocksError(ValueError):
         pass
 
 

@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Deque, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Deque, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from vllm.core.block.common import (BlockPool, CopyOnWriteTracker, RefCounter,
                                     get_all_blocks_recursively)
@@ -110,7 +110,8 @@ class NaiveBlockAllocator(BlockAllocator):
     def allocate_mutable_block(
             self,
             prev_block: Optional[Block],
-            device: Optional[Device] = None) -> AllocationOutput:
+            device: Optional[Device] = None,
+            block_ids_in_use: Optional[Set[int]] = None) -> AllocationOutput:
         """Allocates a new mutable block, linked to the previous block.
 
         Args:
@@ -122,18 +123,30 @@ class NaiveBlockAllocator(BlockAllocator):
             Block: The newly allocated mutable block.
         """
         assert device is None
-        block_id = self._allocate_block_id()
+        block_id = self._allocate_block_id(block_ids_in_use)
         block = self._block_pool.init_block(prev_block=prev_block,
                                             token_ids=[],
                                             block_size=self._block_size,
                                             physical_block_id=block_id)
         return AllocationOutput(block)
 
-    def _allocate_block_id(self) -> BlockId:
+    def _allocate_block_id(self,
+                           block_ids_in_use: Optional[Set[int]] = None
+                           ) -> BlockId:
         if not self._free_block_indices:
             raise BlockAllocator.NoFreeBlocksError()
 
         block_id = self._free_block_indices.popleft()
+        if block_ids_in_use is not None:
+            tmp_free_block_indices: Deque[int] = deque()
+            while block_id in block_ids_in_use:
+                tmp_free_block_indices.append(block_id)
+                if self._free_block_indices:
+                    block_id = self._free_block_indices.popleft()
+                else:
+                    self._free_block_indices = tmp_free_block_indices
+                    raise BlockAllocator.NoUnusedBlocksError()
+            self._free_block_indices += tmp_free_block_indices
         self._refcounter.incr(block_id)
         return block_id
 
