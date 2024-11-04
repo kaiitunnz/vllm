@@ -1067,7 +1067,7 @@ class Scheduler:
         seq_metas_to_allocate: List[List[SequenceMeta]] = []
         num_allocated_blocks = 0
         # List of (num_lookahead_slots, num_new_tokens, num_new_seqs)
-        seq_group_meta_list: List[Tuple[int, int, int]] = []
+        seq_group_meta_list: List[Tuple[int, int]] = []
         allocated_evicted_blocks: List[int] = []
 
         with self.waiting as waiting_queue:
@@ -1163,10 +1163,13 @@ class Scheduler:
                         seq_group,
                         seq_metas[0],
                         num_lookahead_slots=num_lookahead_slots))
+                budget.add_num_batched_tokens(seq_group.request_id,
+                                              num_new_tokens)
+                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
 
                 # Keep the states to be used in the allocation.
                 seq_group_meta_list.append(
-                    (num_lookahead_slots, num_new_tokens, num_new_seqs))
+                    (num_lookahead_slots, num_new_tokens))
 
             # Get the block IDs to be used in the next step.
             block_ids_in_use = self.block_manager.get_block_ids_in_use([
@@ -1178,8 +1181,7 @@ class Scheduler:
             for seq_group, seq_metas, seq_group_meta in zip(
                     seq_groups_to_allocate, seq_metas_to_allocate,
                     seq_group_meta_list):
-                (num_lookahead_slots, num_new_tokens,
-                 num_new_seqs) = seq_group_meta
+                (num_lookahead_slots, num_new_tokens) = seq_group_meta
                 # Can schedule this request.
                 if curr_loras is not None and seq_group.lora_int_id > 0:
                     curr_loras.add(seq_group.lora_int_id)
@@ -1208,9 +1210,6 @@ class Scheduler:
                 seq_groups.append(
                     ScheduledSequenceGroup(seq_group=seq_group,
                                            token_chunk_size=num_new_tokens))
-                budget.add_num_batched_tokens(seq_group.request_id,
-                                              num_new_tokens)
-                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
 
             blocks_to_move_in, blocks_to_move_out = (
                 self._get_and_reset_blocks_to_move())
@@ -1963,7 +1962,8 @@ class Scheduler:
                     num_new_tokens = 0 \
                         if num_new_tokens > remaining_token_budget \
                         else num_new_tokens
-            elif self.cache_config.enable_prefix_caching:
+            elif (self.cache_config.enable_prefix_caching
+                  or self.cache_config.enable_multi_tier_prefix_caching):
                 # When prefix caching is enabled, we always allocate
                 # the number of new tokens that is dividable by the block
                 # size to avoid partial block matching.
