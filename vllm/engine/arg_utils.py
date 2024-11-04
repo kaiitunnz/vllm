@@ -110,6 +110,7 @@ class EngineArgs:
     enable_async_swapping: bool = False
     enable_async_prefetching: bool = False
     enable_prefix_aware_scheduling: bool = False
+    scheduler_window_size: Optional[int] = None
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
@@ -382,6 +383,12 @@ class EngineArgs:
         parser.add_argument('--enable-prefix-aware-scheduling',
                             action='store_true',
                             help='Enables prefix-aware scheduling.')
+        parser.add_argument(
+            '--scheduler-window-size',
+            type=int,
+            default=None,
+            help='If specified, use this window size for the prefix-aware '
+            'scheduler.')
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '

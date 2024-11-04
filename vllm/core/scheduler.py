@@ -366,7 +366,12 @@ class Scheduler:
         # Contain new prefill or preempted requests.
         self.waiting: WaitQueueBase
         if self.scheduler_config.enable_prefix_aware_scheduling:
-            self.waiting = PrefixAwareWaitQueue(self.block_manager)
+            if scheduler_config.scheduler_window_size is None:
+                self.waiting = MTWaitQueue(self.block_manager)
+            else:
+                self.waiting = PrefixAwareWaitQueue(
+                    self.block_manager,
+                    window_size=scheduler_config.scheduler_window_size)
         elif self.scheduler_config.use_mt_block_manager:
             self.waiting = MTWaitQueue(self.block_manager)
         else:
