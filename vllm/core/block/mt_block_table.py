@@ -85,6 +85,9 @@ class MTBlockTable:
         cached_blocks_to_move_in: List[Block],
         full_blocks: List[Block],
         tail_block_token_ids: List[int],
+        cached_blocks_order: List[int],
+        cached_blocks_to_move_in_order: List[int],
+        full_blocks_order: List[int],
         block_ids_in_use: Set[int],
         device: Device = Device.GPU,
     ) -> None:
@@ -105,6 +108,9 @@ class MTBlockTable:
             cached_blocks_to_move_in=cached_blocks_to_move_in,
             full_blocks=full_blocks,
             tail_block_token_ids=tail_block_token_ids,
+            cached_blocks_order=cached_blocks_order,
+            cached_blocks_to_move_in_order=cached_blocks_to_move_in_order,
+            full_blocks_order=full_blocks_order,
             block_ids_in_use=block_ids_in_use,
             device=device,
         )
@@ -281,35 +287,41 @@ class MTBlockTable:
         cached_blocks_to_move_in: List[Block],
         full_blocks: List[Block],
         tail_block_token_ids: List[int],
+        cached_blocks_order: List[int],
+        cached_blocks_to_move_in_order: List[int],
+        full_blocks_order: List[int],
         block_ids_in_use: Set[int],
         device: Device,
     ) -> List[Block]:
-        blocks: List[Block] = []
+        blocks: List[Optional[Block]] = [None] * (
+            len(cached_blocks) + len(cached_blocks_to_move_in) +
+            len(full_blocks) + (1 if tail_block_token_ids else 0))
 
         # Highest-tier device
-        for block in cached_blocks:
+        for block, order in zip(cached_blocks, cached_blocks_order):
             alloc = self._allocator.allocate_cached_block(block)
             assert alloc.evicted_meta is None
-        blocks.extend(cached_blocks)
+            blocks[order] = block
 
         # Lower-tier devices
         self._allocator.move_in(cached_blocks_to_move_in,
                                 block_ids_in_use=block_ids_in_use)
-        blocks.extend(cached_blocks_to_move_in)
+        for block, order in zip(cached_blocks_to_move_in,
+                                cached_blocks_to_move_in_order):
+            blocks[order] = block
 
         blocks_to_move_out = []
-        prev_block = None
         # Uncached blocks
-        for block in full_blocks:
+        for block, order in zip(full_blocks, full_blocks_order):
             alloc = self._allocator.promote_placeholder_block(
                 block, device=device, block_ids_in_use=block_ids_in_use)
             if alloc.evicted_meta is not None:
                 blocks_to_move_out.append(alloc.evicted_meta)
-            blocks.append(alloc.block)
-            prev_block = blocks[-1]
+            blocks[order] = alloc.block
 
         # Tail block
         if tail_block_token_ids:
+            prev_block = blocks[-2] if len(blocks) > 1 else None
             alloc = self._allocator.allocate_mutable_block(
                 prev_block=prev_block,
                 device=device,
@@ -317,13 +329,13 @@ class MTBlockTable:
             alloc.block.append_token_ids(tail_block_token_ids)
             if alloc.evicted_meta is not None:
                 blocks_to_move_out.append(alloc.evicted_meta)
-            blocks.append(alloc.block)
+            blocks[-1] = alloc.block
 
         # Perform hierarchical eviction
         self._allocator.move_out(blocks_to_move_out,
                                  block_ids_in_use=block_ids_in_use)
 
-        return blocks
+        return blocks  # type: ignore
 
     def _get_all_token_ids(self) -> List[int]:
         # NOTE: This function is O(seq_len); use sparingly.
