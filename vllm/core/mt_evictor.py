@@ -94,6 +94,10 @@ class LRUMTEvictor(MTEvictor):
                 break
             if evicted_meta.num_hashed_tokens < block_meta.num_hashed_tokens:
                 evicted_meta, evicted_id = block_meta, block_id
+            elif (evicted_meta.num_hashed_tokens
+                  == block_meta.num_hashed_tokens) and (
+                      evicted_meta.hit_count > block_meta.hit_count):
+                evicted_meta, evicted_id = block_meta, block_id
 
         assert evicted_meta is not None
         assert evicted_id is not None
