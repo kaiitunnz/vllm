@@ -390,6 +390,7 @@ class MTPrefixAwareBlockAllocator(MTDeviceAwareBlockAllocator):
             evictable=evictable)
 
         dst_block_id = alloc.block.block_id
+        assert block_ids_in_use is None or dst_block_id not in block_ids_in_use
         assert dst_block_id is not None
         src_block_id = self._allocators[src_device].get_physical_block_id(
             src_block_id)

@@ -31,18 +31,25 @@ class SequenceMeta:
             self.cached_blocks: List[Block] = []
             self.cached_blocks_token_ids: List[List[int]] = []
             self.cached_blocks_hashes: List[int] = []
+            self.cached_blocks_order: List[int] = []
 
             self.cached_blocks_to_move_in: List[Block] = []
             self.cached_blocks_to_move_in_token_ids: List[List[int]] = []
             self.cached_blocks_to_move_in_hashes: List[int] = []
+            self.cached_blocks_to_move_in_order: List[int] = []
 
             self.full_blocks: List[Block] = []
+            self.full_blocks_order: List[int] = []
+
+            self.counter: int = 0
 
         def add_cached_block(self, block: Block, token_ids: List[int],
                              content_hash: int) -> None:
             self.cached_blocks.append(block)
             self.cached_blocks_token_ids.append(token_ids)
             self.cached_blocks_hashes.append(content_hash)
+            self.cached_blocks_order.append(self.counter)
+            self.counter += 1
 
         def add_cached_block_to_move_in(self, block: Block,
                                         token_ids: List[int],
@@ -50,10 +57,14 @@ class SequenceMeta:
             self.cached_blocks_to_move_in.append(block)
             self.cached_blocks_to_move_in_token_ids.append(token_ids)
             self.cached_blocks_to_move_in_hashes.append(content_hash)
+            self.cached_blocks_to_move_in_order.append(self.counter)
+            self.counter += 1
 
         def add_full_block(self, block: Block) -> None:
             assert block.content_hash is not None
             self.full_blocks.append(block)
+            self.full_blocks_order.append(self.counter)
+            self.counter += 1
 
         def iter_cached_blocks(self) -> Iterable[Tuple[List[int], int]]:
             return zip(self.cached_blocks_token_ids, self.cached_blocks_hashes)
@@ -76,9 +87,14 @@ class SequenceMeta:
             self.cached_blocks = []
             self.cached_blocks_token_ids = []
             self.cached_blocks_hashes = []
+            self.cached_blocks_order = []
+
             self.cached_blocks_to_move_in = []
             self.cached_blocks_to_move_in_token_ids = []
             self.cached_blocks_to_move_in_hashes = []
+            self.cached_blocks_to_move_in_order = []
+
+            self.counter = 0
 
     def __init__(self, seq: Sequence, block_size: int,
                  allocator: MTDeviceAwareBlockAllocator):
@@ -102,12 +118,24 @@ class SequenceMeta:
         return self._manager.cached_blocks
 
     @property
+    def cached_blocks_order(self):
+        return self._manager.cached_blocks_order
+
+    @property
     def cached_blocks_to_move_in(self):
         return self._manager.cached_blocks_to_move_in
 
     @property
+    def cached_blocks_to_move_in_order(self):
+        return self._manager.cached_blocks_to_move_in_order
+
+    @property
     def full_blocks(self):
         return self._manager.full_blocks
+
+    @property
+    def full_blocks_order(self):
+        return self._manager.full_blocks_order
 
     @property
     def tail_block_token_ids(self):
@@ -458,6 +486,10 @@ class MTBlockSpaceManager:
             cached_blocks_to_move_in=seq_meta.cached_blocks_to_move_in,
             full_blocks=seq_meta.full_blocks,
             tail_block_token_ids=seq_meta.tail_block_token_ids,
+            cached_blocks_order=seq_meta.cached_blocks_order,
+            cached_blocks_to_move_in_order=(
+                seq_meta.cached_blocks_to_move_in_order),
+            full_blocks_order=seq_meta.full_blocks_order,
             block_ids_in_use=block_ids_in_use,
         )
 

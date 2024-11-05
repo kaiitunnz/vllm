@@ -144,7 +144,7 @@ class NaiveBlockAllocator(BlockAllocator):
                 if self._free_block_indices:
                     block_id = self._free_block_indices.popleft()
                 else:
-                    self._free_block_indices = tmp_free_block_indices
+                    self._free_block_indices += tmp_free_block_indices
                     raise BlockAllocator.NoUnusedBlocksError()
             self._free_block_indices += tmp_free_block_indices
         self._refcounter.incr(block_id)
