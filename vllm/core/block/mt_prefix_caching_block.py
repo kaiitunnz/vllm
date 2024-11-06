@@ -287,8 +287,16 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
             # The block has been computed by another sequence.
             # We can reuse the cached block.
             cached_block = self._prefix_cache[block.content_hash]
+            block_id = cached_block.block_id
+            assert block_id is not None
             self.destroy(block, keep_prefix_cache=True)
-            return self.allocate_cached_block(cached_block)
+            # Perform cached block allocation here.
+            # Cannot use allocate_cached_block() as it sets computed to True.
+            self.metric_data.query(hit=True)
+            self._refcounter.incr(block_id)
+            self._block_tracker[block_id].hit()
+            alloc = MTAllocationOutput(cached_block)
+            return alloc
 
         self.metric_data.query(hit=False)
 
@@ -786,20 +794,15 @@ class MTPrefixCachingBlockAllocator(MTBlockAllocator):
         block_ids: List[int],
         skip_last_block_id: bool = True,
     ) -> List[int]:
-        prev_prefix_size = len(prev_computed_block_ids)
-        cur_size = len(block_ids)
-        if skip_last_block_id:
-            cur_size -= 1
+        # Ignore prev_computed_block_ids due to unordered eviction.
+        assert not skip_last_block_id or len(block_ids) > 0
+        block_ids = block_ids[:-1] if skip_last_block_id else block_ids
 
-        # Sanity checks
-        assert cur_size >= 0
-        assert prev_prefix_size <= cur_size
-
-        ret = prev_computed_block_ids
-        for i in range(prev_prefix_size, cur_size):
-            block_id = block_ids[i]
-            if self.block_is_computed(block_id):
-                ret.append(block_id)
+        ret = []
+        for block_id in block_ids:
+            if not self.block_is_computed(block_id):
+                break
+            ret.append(block_id)
         return ret
 
     def get_common_computed_block_ids(
