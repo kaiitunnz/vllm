@@ -37,6 +37,7 @@ class Scheduler:
         log_stats: bool,
         structured_output_manager: StructuredOutputManager,
     ) -> None:
+        logger.warning("[%s] DSMA Started", time.time())
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         self.lora_config = lora_config
@@ -421,6 +422,26 @@ class Scheduler:
             free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+        )
+
+        num_new_reqs = len(scheduled_new_reqs)
+        num_resumed_reqs = len(scheduled_resumed_reqs)
+        num_running_reqs = len(scheduled_running_reqs)
+        num_all_running_reqs = num_new_reqs + num_resumed_reqs + num_running_reqs
+        num_received_reqs = len(self.requests)
+        logger.warning(
+            "[%s] DSMA Info: "
+            "num_new_reqs=%d, "
+            "num_resumed_reqs=%d, "
+            "num_running_reqs=%d, "
+            "num_all_running_reqs=%d, "
+            "num_received_reqs=%d",
+            time.time(),
+            num_new_reqs,
+            num_resumed_reqs,
+            num_running_reqs,
+            num_all_running_reqs,
+            num_received_reqs,
         )
 
         self.finished_req_ids = set()
