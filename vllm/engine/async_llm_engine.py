@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import logging
 import time
 import weakref
 from functools import partial
@@ -23,7 +24,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.executor.executor_base import ExecutorBase
 from vllm.inputs import PromptType
 from vllm.inputs.preprocess import InputPreprocessor
-from vllm.logger import init_logger
+from vllm.logger import get_benchmark_logger, init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.guided_decoding import (
     get_guided_decoding_logits_processor)
@@ -944,6 +945,8 @@ class AsyncLLMEngine(EngineClient):
             raise ValueError(f"Got priority {priority} but "
                              "Priority scheduling is not enabled.")
 
+        get_benchmark_logger().warning("[%s] DSMA Info: Add request %s", time.time(), request_id)
+        
         stream = self._request_tracker.add_request(
             request_id,
             verbose=self.log_requests,

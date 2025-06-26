@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import logging
 import os
 import random
 import time
@@ -12,7 +13,7 @@ from typing import Set, Tuple, Union
 
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
-from vllm.logger import init_logger
+from vllm.logger import get_benchmark_logger, init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
@@ -432,6 +433,8 @@ class Scheduler:
         pipeline_parallel_size: int = 1,
         output_proc_callback: Optional[Callable] = None,
     ) -> None:
+        get_benchmark_logger().warning("[%s] DSMA Started", time.time())
+
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         # Note for LoRA scheduling: the current policy is extremely
@@ -1644,6 +1647,32 @@ class Scheduler:
 
         # Move to next cache (if exists)
         self.cache_id = self.next_cache_id
+
+
+        num_new_reqs = 0
+        num_resumed_reqs = 0
+        num_running_reqs = 0
+        num_all_running_reqs = len(seq_group_metadata_list)
+        num_received_reqs = len(self.running) + len(self.waiting) + len(self.swapped)
+        for seq_group_metadata in seq_group_metadata_list:
+            if seq_group_metadata.is_prompt:
+                num_new_reqs += 1
+            else:
+                num_running_reqs += 1
+        get_benchmark_logger().warning(
+            "[%s] DSMA Info: "
+            "num_new_reqs=%d, "
+            "num_resumed_reqs=%d, "
+            "num_running_reqs=%d, "
+            "num_all_running_reqs=%d, "
+            "num_received_reqs=%d",
+            time.time(),
+            num_new_reqs,
+            num_resumed_reqs,
+            num_running_reqs,
+            num_all_running_reqs,
+            num_received_reqs,
+        )
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,

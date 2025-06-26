@@ -208,3 +208,31 @@ def enable_trace_function_call(log_file_path: str,
         # by default, this is the vllm root directory
         root_dir = os.path.dirname(os.path.dirname(__file__))
     sys.settrace(partial(_trace_calls, log_file_path, root_dir))
+
+_benchmark_logger: Optional[Logger] = None
+
+
+def init_benchmark_logger() -> Logger:
+    global _benchmark_logger
+
+    # TODO(noppanat): Make this configurable
+    log_file = "logs/server.log"
+    log_level = logging.WARNING
+
+    logger = logging.getLogger("benchmark")
+    for handler in logger.handlers:
+        logger.removeHandler(handler)
+    if log_file is not None:
+        handler = logging.FileHandler(log_file, mode="a")
+        handler.setLevel(log_level)
+        logger.addHandler(handler)
+    logger.propagate = False
+
+    _benchmark_logger = logger
+    return _benchmark_logger
+
+
+def get_benchmark_logger() -> Logger:
+    if _benchmark_logger is None:
+        return init_benchmark_logger()
+    return _benchmark_logger

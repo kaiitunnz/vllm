@@ -33,7 +33,7 @@ from vllm.inputs import (INPUT_REGISTRY, InputRegistry, ProcessorInputs,
                          PromptType, SingletonInputsAdapter)
 from vllm.inputs.parse import is_encoder_decoder_inputs, is_token_prompt
 from vllm.inputs.preprocess import InputPreprocessor
-from vllm.logger import init_logger
+from vllm.logger import get_benchmark_logger, init_logger
 from vllm.logits_process import get_bad_words_logits_processors
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.guided_decoding import (
@@ -788,6 +788,8 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
         processed_inputs = self.input_processor(preprocessed_inputs)
+
+        get_benchmark_logger().warning("[%s] DSMA Info: Add request %s", time.time(), request_id)
 
         self._add_processed_request(
             request_id=request_id,
