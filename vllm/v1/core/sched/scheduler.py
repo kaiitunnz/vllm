@@ -63,6 +63,13 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.scheduler_config.max_model_len
 
+        logger.warning(
+            "[%s] Helium Started (max_num_running_seqs=%s, max_num_scheduled_tokens=%s)",
+            time.time(),
+            self.max_num_running_reqs,
+            self.max_num_scheduled_tokens,
+        )
+
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
@@ -504,6 +511,26 @@ class Scheduler(SchedulerInterface):
         #    computed tokens will be adjusted in update_from_output.
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             self.requests[req_id].num_computed_tokens += num_scheduled_token
+
+        num_new_reqs = len(scheduled_new_reqs)
+        num_resumed_reqs = len(scheduled_resumed_reqs)
+        num_running_reqs = len(scheduled_running_reqs)
+        num_all_running_reqs = num_new_reqs + num_resumed_reqs + num_running_reqs
+        num_received_reqs = len(self.requests)
+        logger.warning(
+            "[%s] Helium Info: "
+            "num_new_reqs=%d, "
+            "num_resumed_reqs=%d, "
+            "num_running_reqs=%d, "
+            "num_all_running_reqs=%d, "
+            "num_received_reqs=%d",
+            time.time(),
+            num_new_reqs,
+            num_resumed_reqs,
+            num_running_reqs,
+            num_all_running_reqs,
+            num_received_reqs,
+        )
 
         self.finished_req_ids = set()
         return scheduler_output

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import time
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
 from typing import Optional, Union
@@ -286,6 +287,8 @@ class AsyncLLM(EngineClient):
             # we can call __init__ before the event loop, which enables us
             # to handle startup failure gracefully in the OpenAI server.
             self._run_output_handler()
+
+            logger.warning("[%s] Helium Info: Add request %s", time.time(), request_id)
 
             q = await self.add_request(
                 request_id,

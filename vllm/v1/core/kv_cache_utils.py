@@ -620,6 +620,13 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
 
     num_blocks = int(available_memory // page_size // len(kv_cache_spec))
     num_blocks = max(num_blocks, 0)
+    logger.warning(
+        "Helium: num_blocks=%d, page_size=%d, available_memory=%d, num_layers=%d",
+        num_blocks,
+        page_size,
+        available_memory,
+        len(kv_cache_spec),
+    )
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_gpu_blocks_override = \
