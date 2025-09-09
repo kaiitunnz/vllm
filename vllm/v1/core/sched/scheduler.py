@@ -517,19 +517,24 @@ class Scheduler(SchedulerInterface):
         num_running_reqs = len(scheduled_running_reqs)
         num_all_running_reqs = num_new_reqs + num_resumed_reqs + num_running_reqs
         num_received_reqs = len(self.requests)
+        num_finished_seqs = len(self.finished_req_ids)
         logger.warning(
             "[%s] Helium Info: "
             "num_new_reqs=%d, "
             "num_resumed_reqs=%d, "
             "num_running_reqs=%d, "
             "num_all_running_reqs=%d, "
-            "num_received_reqs=%d",
+            "num_received_reqs=%d, "
+            "num_finished_seqs=%d, "
+            "total_num_scheduled_tokens=%d",
             time.time(),
             num_new_reqs,
             num_resumed_reqs,
             num_running_reqs,
             num_all_running_reqs,
             num_received_reqs,
+            num_finished_seqs,
+            total_num_scheduled_tokens,
         )
 
         self.finished_req_ids = set()
@@ -800,6 +805,8 @@ class Scheduler(SchedulerInterface):
         disconnects.
         """
         assert RequestStatus.is_finished(finished_status)
+        if finished_status == RequestStatus.FINISHED_ABORTED:
+            logger.warning("[%s] Helium Info: Request aborted by user", time.time())
         if isinstance(request_ids, str):
             request_ids = (request_ids, )
         else:
