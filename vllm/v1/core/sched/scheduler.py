@@ -509,8 +509,11 @@ class Scheduler(SchedulerInterface):
         #    scheduling step.
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
+        num_effective_tokens: int = 0
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
-            self.requests[req_id].num_computed_tokens += num_scheduled_token
+            request = self.requests[req_id]
+            request.num_computed_tokens += num_scheduled_token
+            num_effective_tokens += request.num_computed_tokens
 
         num_new_reqs = len(scheduled_new_reqs)
         num_resumed_reqs = len(scheduled_resumed_reqs)
@@ -526,7 +529,8 @@ class Scheduler(SchedulerInterface):
             "num_all_running_reqs=%d, "
             "num_received_reqs=%d, "
             "num_finished_seqs=%d, "
-            "total_num_scheduled_tokens=%d",
+            "total_num_scheduled_tokens=%d, "
+            "num_effective_tokens=%d",
             time.time(),
             num_new_reqs,
             num_resumed_reqs,
@@ -535,6 +539,7 @@ class Scheduler(SchedulerInterface):
             num_received_reqs,
             num_finished_seqs,
             total_num_scheduled_tokens,
+            num_effective_tokens,
         )
 
         self.finished_req_ids = set()
@@ -782,7 +787,7 @@ class Scheduler(SchedulerInterface):
             scheduler_stats=self.make_stats(spec_decoding_stats),
         )
         if self.include_finished_set:
-            #TODO currently sending duplicates here, improve this
+            # TODO currently sending duplicates here, improve this
             engine_core_outputs.finished_requests = (
                 scheduler_output.finished_req_ids | self.finished_req_ids)
 
