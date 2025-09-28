@@ -25,6 +25,7 @@ from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.utils import BackgroundProcHandle
 
@@ -648,6 +649,11 @@ class AsyncMPClient(MPClient):
 
         self.outputs_queue = asyncio.Queue[Union[EngineCoreOutputs,
                                                  Exception]]()
+
+        # For backpressure scheduling
+        self._cur_scheduler_stats: Optional[SchedulerStats] = None
+        self._stats_cvar = asyncio.Condition()
+
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -699,11 +705,32 @@ class AsyncMPClient(MPClient):
 
                     if outputs.outputs or outputs.scheduler_stats:
                         outputs_queue.put_nowait(outputs)
+
+                    if outputs.scheduler_stats:
+                        async with self._stats_cvar:
+                            self._cur_scheduler_stats = outputs.scheduler_stats
+                            self._stats_cvar.notify_all()
             except Exception as e:
                 outputs_queue.put_nowait(e)
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask")
+
+    async def get_scheduler_stats(self) -> SchedulerStats:
+        """Wait until the next scheduler stats are available and return them."""
+        async with self._stats_cvar:
+            await self._stats_cvar.wait_for(
+                lambda: self._cur_scheduler_stats is not None
+            )
+            assert self._cur_scheduler_stats is not None
+            stats = self._cur_scheduler_stats
+            self._cur_scheduler_stats = None
+            return stats
+
+    async def clear_scheduler_stats(self) -> None:
+        """Clear any pending scheduler stats without returning them."""
+        async with self._stats_cvar:
+            self._cur_scheduler_stats = None
 
     async def get_output_async(self) -> EngineCoreOutputs:
         self._ensure_output_queue_task()

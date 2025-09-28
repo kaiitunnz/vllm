@@ -422,6 +422,12 @@ class AsyncLLM(EngineClient):
             stat_logger.record(scheduler_stats=scheduler_stats,
                                iteration_stats=iteration_stats)
 
+    async def get_scheduler_stats(self) -> SchedulerStats:
+        return await self.engine_core.get_scheduler_stats()
+            
+    async def clear_scheduler_stats(self) -> None:
+        await self.engine_core.clear_scheduler_stats()
+
     def encode(
         self,
         prompt: PromptType,
