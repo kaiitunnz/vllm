@@ -237,8 +237,12 @@ class OpenAIServing:
 
         # Note: TokenizeRequest and DetokenizeRequest doesn't have max_tokens
         # and does not require model context length validation
-        if isinstance(request, (TokenizeCompletionRequest, TokenizeChatRequest,
-                                DetokenizeRequest)):
+        request_type = str(type(request))
+        if (
+            ("TokenizeCompletionRequest" in request_type)
+            or ("TokenizeChatRequest" in request_type)
+            or ("DetokenizeRequest" in request_type)
+        ):
             return TextTokensPrompt(prompt=input_text,
                                     prompt_token_ids=input_ids)
 

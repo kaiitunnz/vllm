@@ -3235,6 +3235,9 @@ class KVTransferConfig(BaseModel):
     # The KV connector for vLLM to transmit KV caches between vLLM instances.
     kv_connector: Optional[str] = None
 
+    # The engine id for KV transfers.
+    engine_id: Optional[str] = None
+
     # The device used by kv connector to buffer the KV cache.
     # Currently only support 'cuda'.
     kv_buffer_device: Optional[str] = "cuda"
