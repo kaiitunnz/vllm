@@ -519,6 +519,9 @@ class AsyncLLM(EngineClient):
         """
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs)
+    
+    async def change_kv_role(self, new_role: str) -> None:
+        await self.engine_core.change_kv_role_async(new_role)
 
     @property
     def is_running(self) -> bool:

@@ -16,6 +16,7 @@ import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -305,6 +306,21 @@ class EngineCore:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+
+    def change_kv_role(self, new_role: str) -> None:
+        # Change scheduler's connector's kv_role
+        if hasattr(self.scheduler, "change_kv_role"):
+            self.scheduler.change_kv_role(new_role)  # type: ignore
+        else:
+            logger.warning("Scheduler does not support changing KV role.")
+        # Change worker's kv_role
+        connector = get_kv_transfer_group()
+        if hasattr(connector, "_lmcache_engine"):
+            lmcache_engine = connector._lmcache_engine  # type: ignore
+            if hasattr(lmcache_engine, "kv_role"):
+                lmcache_engine.kv_role = new_role  # type: ignore
+                return
+        logger.warning("Worker's connector does not support changing KV role.")
 
 
 class EngineCoreProc(EngineCore):

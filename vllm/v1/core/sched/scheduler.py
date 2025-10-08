@@ -134,6 +134,18 @@ class Scheduler(SchedulerInterface):
             use_eagle=self.use_eagle,
             log_stats=self.log_stats)
 
+    def change_kv_role(self, new_role: str) -> None:
+        if self.connector is not None:
+            connector = self.connector
+            if hasattr(connector, "_lmcache_engine"):
+                lmcache_engine = connector._lmcache_engine  # type: ignore
+                if hasattr(lmcache_engine, "kv_role"):
+                    lmcache_engine.kv_role = new_role  # type: ignore
+                    return
+            logger.warning("Worker's connector does not support changing KV role.")
+        else:
+            logger.warning("KVConnector is not initialized.")
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.

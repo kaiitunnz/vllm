@@ -849,6 +849,9 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async("collective_rpc", method, timeout,
                                              args, kwargs)
 
+    async def change_kv_role_async(self, new_role: str) -> None:
+        await self.call_utility_async("change_kv_role", new_role)
+
 
 class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
