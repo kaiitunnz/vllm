@@ -29,6 +29,7 @@ class Request:
         arrival_time: float,
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
+        is_precompute: bool = False,
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -36,6 +37,7 @@ class Request:
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
         self.structured_output_request = structured_output_request
+        self.is_precompute = is_precompute
 
         self.status = (RequestStatus.WAITING_FOR_FSM
                        if sampling_params.guided_decoding is not None else
@@ -89,6 +91,7 @@ class Request:
             lora_request=request.lora_request,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params),
+            is_precompute=bool(request.priority)
         )
 
     def append_output_token_ids(

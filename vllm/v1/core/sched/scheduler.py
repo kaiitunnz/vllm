@@ -81,6 +81,7 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
+        self.precomputed: deque[Request] = deque()
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -129,7 +130,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            enable_caching=self.cache_config.enable_prefix_caching,
+            enable_caching=self.cache_config.enable_prefix_caching,  # type: ignore
             caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
             use_eagle=self.use_eagle,
             log_stats=self.log_stats)
@@ -185,6 +186,7 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        has_preempted = False
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -225,6 +227,7 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            preempt_current = False
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -233,6 +236,12 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    if self.running[-1] == request:
+                        # Preempt the current request.
+                        preempt_current = True
+                        # No more request to preempt.
+                        can_schedule = False
+                        break
                     preempted_req = self.running.pop()
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
@@ -243,15 +252,51 @@ class Scheduler(SchedulerInterface):
 
                     self.waiting.appendleft(preempted_req)
                     preempted_reqs.append(preempted_req)
-                    if preempted_req == request:
-                        # No more request to preempt.
-                        can_schedule = False
-                        break
                 else:
                     # The request can be scheduled.
                     can_schedule = True
                     break
+
+            has_preempted = has_preempted or len(preempted_reqs) > 0
+
+            if not can_schedule and self.precomputed:
+                while True:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+                    if new_blocks is None:
+                        # The request cannot be scheduled.
+                        # Free the precomputed request
+                        if self.precomputed:
+                            preempted_req = self.precomputed.popleft()
+                            preempted_req.is_precompute = False
+                            self._free_request(preempted_req)
+                            has_preempted = True
+                        else:
+                            # No more request to preempt.
+                            can_schedule = False
+                            break
+                    else:
+                        # The request can be scheduled.
+                        can_schedule = True
+                        break
+
             if not can_schedule:
+                if preempt_current:
+                    # Preempt the current request.
+                    preempted_req = self.running.pop()
+                    self.kv_cache_manager.free(preempted_req)
+                    preempted_req.status = RequestStatus.PREEMPTED
+                    preempted_req.num_computed_tokens = 0
+                    if self.log_stats:
+                        preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+
+                    self.waiting.appendleft(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    has_preempted = True
                 break
             assert new_blocks is not None
 
@@ -303,7 +348,7 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests: deque[Request] = deque()
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
+        if not has_preempted:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -371,12 +416,23 @@ class Scheduler(SchedulerInterface):
                     encoder_inputs_to_schedule = None
                     new_encoder_budget = encoder_budget
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_tokens,
-                    computed_blocks,
-                    num_lookahead_tokens=self.num_lookahead_tokens,
-                )
+                while True:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens + num_external_tokens,
+                        computed_blocks,
+                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+                    if new_blocks is None:
+                        # The request cannot be scheduled.
+                        # Free the precomputed request
+                        if self.precomputed:
+                            preempted_req = self.precomputed.popleft()
+                            preempted_req.is_precompute = False
+                            self._free_request(preempted_req)
+                            continue
+                    break
+                
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     break
@@ -805,6 +861,9 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> None:
         assert request.is_finished()
+        if request.is_precompute:
+            self.precomputed.append(request)
+            return
         self.kv_cache_manager.free(request)
         self.kv_cache_manager.free_block_hashes(request)
         self.encoder_cache_manager.free(request)
@@ -819,6 +878,10 @@ class Scheduler(SchedulerInterface):
         return len(self.finished_req_ids) > 0
 
     def reset_prefix_cache(self) -> bool:
+        for request in self.precomputed:
+            request.is_precompute = False
+            self._free_request(request)
+        self.precomputed.clear()
         return self.kv_cache_manager.reset_prefix_cache()
 
     def make_stats(
