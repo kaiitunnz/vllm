@@ -349,6 +349,15 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not has_preempted:
+            if self.waiting and token_budget > 0:
+                # Longest-shared-prefix-first (LSPF) scheduling.
+                self.waiting = deque(
+                    sorted(
+                        self.waiting,
+                        key=self.kv_cache_manager.get_num_computed_tokens,
+                        reverse=True,
+                    )
+                )
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
