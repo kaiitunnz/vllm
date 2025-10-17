@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Optional, Union
 
 from vllm.config import VllmConfig
@@ -30,6 +32,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
+TRACE_FILE_PATH = Path("logs/llm_trace.jsonl")
+USAGE_FILE_PATH = Path("logs/llm_usage.jsonl")
 USE_LSPF: bool = False  # Whether to use the LSPF scheduling algorithm.
 
 
@@ -135,6 +139,14 @@ class Scheduler(SchedulerInterface):
             caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
             use_eagle=self.use_eagle,
             log_stats=self.log_stats)
+        
+        self.prefilled_reqs: set[str] = set()
+        self.trace_file = open(
+            TRACE_FILE_PATH.with_stem(f"{TRACE_FILE_PATH.stem}-{id(self)}"), "w"
+        )
+        self.usage_file = open(
+            USAGE_FILE_PATH.with_stem(f"{USAGE_FILE_PATH.stem}-{id(self)}"), "w"
+        )
 
     def change_kv_role(self, new_role: str) -> None:
         if self.connector is not None:
@@ -491,6 +503,17 @@ class Scheduler(SchedulerInterface):
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_budget = new_encoder_budget
+                
+                # Logging trace of requests prefilled for the first time
+                if request.request_id not in self.prefilled_reqs:
+                    trace_entry = {
+                        "timestamp": time.time(),
+                        "request_id": request.request_id,
+                        "token_ids": request.prompt_token_ids,
+                    }
+                    print(json.dumps(trace_entry), file=self.trace_file, flush=True)
+                    self.prefilled_reqs.add(request.request_id)
+
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
@@ -880,6 +903,15 @@ class Scheduler(SchedulerInterface):
         self._cached_reqs_data.pop(request.request_id, None)
         del self.requests[request.request_id]
         self.finished_req_ids.add(request.request_id)
+        self.prefilled_reqs.discard(request.request_id)
+
+        # Logging usage of finished requests
+        usage_entry = {
+            "request_id": request.request_id,
+            "prompt_tokens": request.num_prompt_tokens,
+            "output_tokens": request.num_output_tokens,
+        }
+        print(json.dumps(usage_entry), file=self.usage_file, flush=True)
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
