@@ -32,6 +32,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
+# Constants for Helium's optimality experiments
 TRACE_FILE_PATH = Path("logs/llm_trace.jsonl")
 USAGE_FILE_PATH = Path("logs/llm_usage.jsonl")
 USE_LSPF: bool = False  # Whether to use the LSPF scheduling algorithm.
