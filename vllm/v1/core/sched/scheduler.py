@@ -30,6 +30,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
+USE_LSPF: bool = False  # Whether to use the LSPF scheduling algorithm.
 
 
 class Scheduler(SchedulerInterface):
@@ -349,6 +350,15 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not has_preempted:
+            if USE_LSPF and self.waiting and token_budget > 0:
+                # Longest-shared-prefix-first (LSPF) scheduling.
+                self.waiting = deque(
+                    sorted(
+                        self.waiting,
+                        key=self.kv_cache_manager.get_num_computed_tokens,
+                        reverse=True,
+                    )
+                )
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
