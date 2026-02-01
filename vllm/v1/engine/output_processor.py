@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.sequence import RequestMetrics
 from vllm.sampling_params import RequestOutputKind
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
@@ -104,6 +105,51 @@ class RequestState:
         self.stats = RequestStateStats(
             arrival_time=arrival_time) if log_stats else None
 
+    def _make_request_metrics(self, finished: bool) -> Optional[RequestMetrics]:
+        """
+        Build v0-style RequestMetrics from V1 per-request stats.
+
+        Note: V1 engine core timestamps are monotonic (time.monotonic()).
+        The returned RequestMetrics uses that same time base.
+        """
+        if self.stats is None:
+            return None
+
+        queued_ts = self.stats.queued_ts
+        scheduled_ts = self.stats.scheduled_ts
+        first_token_ts = self.stats.first_token_ts
+        last_token_ts = self.stats.last_token_ts
+
+        # Use a monotonic "arrival" timestamp aligned with the rest of the
+        # engine core timestamps. Prefer first QUEUED, then SCHEDULED, then
+        # token timestamps.
+        arrival_time = (
+            queued_ts
+            or scheduled_ts
+            or first_token_ts
+            or last_token_ts
+            or 0.0
+        )
+        last_token_time = last_token_ts or arrival_time
+
+        first_scheduled_time = scheduled_ts or None
+        first_token_time = first_token_ts or None
+        time_in_queue = (
+            (scheduled_ts - queued_ts)
+            if (scheduled_ts and queued_ts)
+            else None
+        )
+        finished_time = last_token_time if finished else None
+
+        return RequestMetrics(
+            arrival_time=arrival_time,
+            last_token_time=last_token_time,
+            first_scheduled_time=first_scheduled_time,
+            first_token_time=first_token_time,
+            time_in_queue=time_in_queue,
+            finished_time=finished_time,
+        )
+
     @classmethod
     def from_new_request(
         cls,
@@ -189,6 +235,7 @@ class RequestState:
             prompt_logprobs=prompt_logprobs,
             outputs=outputs,
             finished=finished,
+            metrics=self._make_request_metrics(finished),
         )
 
     def _new_completion_output(
@@ -388,6 +435,31 @@ class OutputProcessor:
                                   engine_core_timestamp: Optional[float],
                                   iteration_stats: Optional[IterationStats]):
         if iteration_stats is None:
+            # Stats collection might be enabled without IterationStats logging
+            # (e.g., for profiling/benchmarks).
+            if engine_core_timestamp is None or req_state.stats is None:
+                return
+
+            req_stats = req_state.stats
+            req_stats.num_generation_tokens += len(engine_core_output.new_token_ids)
+
+            # Process request-level engine core events.
+            if engine_core_output.events is not None:
+                from vllm.v1.engine import EngineCoreEventType
+                for event in engine_core_output.events:
+                    if event.type == EngineCoreEventType.QUEUED:
+                        req_stats.queued_ts = event.timestamp
+                    elif event.type == EngineCoreEventType.SCHEDULED:
+                        if req_stats.scheduled_ts == 0.0:  # ignore preemptions
+                            req_stats.scheduled_ts = event.timestamp
+                    elif event.type == EngineCoreEventType.PREEMPTED:
+                        # No-op for basic timing stats.
+                        pass
+
+            # Token timestamps (engine core monotonic).
+            if req_state.is_prefilling:
+                req_stats.first_token_ts = engine_core_timestamp
+            req_stats.last_token_ts = engine_core_timestamp
             return
 
         lora_stats = self.lora_states.get_stats(req_state)

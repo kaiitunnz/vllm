@@ -46,6 +46,7 @@ class AsyncLLM(EngineClient):
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        emit_stats: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
@@ -59,7 +60,8 @@ class AsyncLLM(EngineClient):
         Args:
             vllm_config: global configuration.
             executor_class: an Executor impl, e.g. MultiprocExecutor.
-            log_stats: Whether to log stats.
+            log_stats: Whether to collect request/iteration stats.
+            emit_stats: Whether to emit stats via stat loggers.
             usage_context: Usage context of the LLM.
             mm_registry: Multi-modal registry.
             use_cached_outputs: Whether to use cached outputs.
@@ -84,11 +86,12 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.log_requests = log_requests
         self.log_stats = log_stats
+        self.emit_stats = emit_stats
 
         # Set up stat loggers; independent set for each DP rank.
         self.stat_loggers: list[list[StatLoggerBase]] = setup_default_loggers(
             vllm_config=vllm_config,
-            log_stats=self.log_stats,
+            log_stats=self.emit_stats,
             engine_num=vllm_config.parallel_config.data_parallel_size,
             custom_stat_loggers=stat_loggers,
         )
@@ -153,7 +156,8 @@ class AsyncLLM(EngineClient):
             start_engine_loop=start_engine_loop,
             stat_loggers=stat_loggers,
             log_requests=not disable_log_requests,
-            log_stats=not disable_log_stats,
+            log_stats=True,
+            emit_stats=not disable_log_stats,
             usage_context=usage_context,
         )
 
@@ -176,7 +180,8 @@ class AsyncLLM(EngineClient):
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_requests=not engine_args.disable_log_requests,
-            log_stats=not engine_args.disable_log_stats,
+            log_stats=True,
+            emit_stats=not engine_args.disable_log_stats,
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
