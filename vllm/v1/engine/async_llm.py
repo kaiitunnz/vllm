@@ -382,6 +382,8 @@ class AsyncLLM(EngineClient):
         # to handle startup failure gracefully in the OpenAI server.
         self._run_output_handler()
 
+        logger.warning("[%s] Helium Info: Add request %s", time.time(), request.request_id)
+
         # Respect pause state before accepting new requests.
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)

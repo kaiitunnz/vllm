@@ -99,6 +99,13 @@ class Scheduler(SchedulerInterface):
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
 
+        logger.warning(
+            "[%s] Helium Started (max_num_running_seqs=%s, max_num_scheduled_tokens=%s)",
+            time.time(),
+            self.scheduler_config.max_num_seqs,
+            self.scheduler_config.max_num_batched_tokens,
+        )
+
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
@@ -945,6 +952,38 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        num_new_reqs = len(scheduled_new_reqs)
+        num_resumed_reqs = len(scheduled_resumed_reqs)
+        num_running_reqs = len(scheduled_running_reqs)
+        num_all_running_reqs = num_new_reqs + num_resumed_reqs + num_running_reqs
+        num_received_reqs = len(self.requests)
+        num_finished_seqs = len(self.finished_req_ids)
+        num_effective_tokens: int = sum(
+            self.requests[req_id].num_computed_tokens + n
+            for req_id, n in num_scheduled_tokens.items()
+            if req_id in self.requests
+        )
+        logger.warning(
+            "[%s] Helium Info: "
+            "num_new_reqs=%d, "
+            "num_resumed_reqs=%d, "
+            "num_running_reqs=%d, "
+            "num_all_running_reqs=%d, "
+            "num_received_reqs=%d, "
+            "num_finished_seqs=%d, "
+            "total_num_scheduled_tokens=%d, "
+            "num_effective_tokens=%d",
+            time.time(),
+            num_new_reqs,
+            num_resumed_reqs,
+            num_running_reqs,
+            num_all_running_reqs,
+            num_received_reqs,
+            num_finished_seqs,
+            total_num_scheduled_tokens,
+            num_effective_tokens,
+        )
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -1724,6 +1763,8 @@ class Scheduler(SchedulerInterface):
         disconnects.
         """
         assert RequestStatus.is_finished(finished_status)
+        if finished_status == RequestStatus.FINISHED_ABORTED:
+            logger.warning("[%s] Helium Info: Request aborted by user", time.time())
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         else:

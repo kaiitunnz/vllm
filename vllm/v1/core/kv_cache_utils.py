@@ -840,6 +840,13 @@ def get_num_blocks(
     """
     num_blocks = int(available_memory // page_size // num_layers)
     num_blocks = max(num_blocks, 0)
+    logger.warning(
+        "Helium: num_blocks=%d, page_size=%d, available_memory=%d, num_layers=%d",
+        num_blocks,
+        page_size,
+        available_memory,
+        num_layers,
+    )
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     return num_blocks
 
