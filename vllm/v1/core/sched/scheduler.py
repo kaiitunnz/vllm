@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -58,7 +60,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-
+# Constants for Helium's optimality experiments
+TRACE_FILE_PATH = Path("logs/llm_trace.jsonl")
+USAGE_FILE_PATH = Path("logs/llm_usage.jsonl")
 USE_LSPF: bool = False  # Whether to use the LSPF scheduling algorithm.
 
 
@@ -274,6 +278,14 @@ class Scheduler(SchedulerInterface):
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 vllm_config=self.vllm_config,
             )
+
+        self.prefilled_reqs: set[str] = set()
+        self.trace_file = open(
+            TRACE_FILE_PATH.with_stem(f"{TRACE_FILE_PATH.stem}-{id(self)}"), "w"
+        )
+        self.usage_file = open(
+            USAGE_FILE_PATH.with_stem(f"{USAGE_FILE_PATH.stem}-{id(self)}"), "w"
+        )
 
     def change_kv_role(self, new_role: str) -> None:
         if self.connector is not None:
@@ -821,6 +833,15 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    # Logging trace of requests prefilled for the first time
+                    if request.request_id not in self.prefilled_reqs:
+                        trace_entry = {
+                            "timestamp": time.time(),
+                            "request_id": request.request_id,
+                            "token_ids": request.prompt_token_ids,
+                        }
+                        print(json.dumps(trace_entry), file=self.trace_file, flush=True)
+                        self.prefilled_reqs.add(request.request_id)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -1782,6 +1803,15 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        self.prefilled_reqs.discard(request_id)
+
+        # Logging usage of finished requests
+        usage_entry = {
+            "request_id": request_id,
+            "prompt_tokens": request.num_prompt_tokens,
+            "output_tokens": request.num_output_tokens,
+        }
+        print(json.dumps(usage_entry), file=self.usage_file, flush=True)
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
