@@ -74,6 +74,7 @@ class AsyncLLM(EngineClient):
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        emit_stats: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
@@ -91,7 +92,8 @@ class AsyncLLM(EngineClient):
         Args:
             vllm_config: global configuration.
             executor_class: an Executor impl, e.g. MultiprocExecutor.
-            log_stats: Whether to log stats.
+            log_stats: Whether to collect request/iteration stats.
+            emit_stats: Whether to emit stats via stat loggers.
             usage_context: Usage context of the LLM.
             mm_registry: Multi-modal registry.
             use_cached_outputs: Whether to use cached outputs.
@@ -116,6 +118,7 @@ class AsyncLLM(EngineClient):
             init_tracer("vllm.llm_engine", tracing_endpoint)
 
         self.log_requests = log_requests
+        self.emit_stats = emit_stats
 
         custom_stat_loggers = list(stat_loggers or [])
         custom_stat_loggers.extend(load_stat_logger_plugin_factories())
@@ -161,7 +164,7 @@ class AsyncLLM(EngineClient):
                 vllm_config=vllm_config,
                 engine_idxs=self.engine_core.engine_ranks_managed,
                 custom_stat_loggers=custom_stat_loggers,
-                enable_default_loggers=log_stats,
+                enable_default_loggers=emit_stats,
                 client_count=client_count,
                 aggregate_engine_logging=aggregate_engine_logging,
             )
@@ -225,7 +228,8 @@ class AsyncLLM(EngineClient):
             start_engine_loop=start_engine_loop,
             stat_loggers=stat_loggers,
             log_requests=enable_log_requests,
-            log_stats=not disable_log_stats,
+            log_stats=True,
+            emit_stats=not disable_log_stats,
             aggregate_engine_logging=aggregate_engine_logging,
             usage_context=usage_context,
             client_addresses=client_addresses,
@@ -252,7 +256,8 @@ class AsyncLLM(EngineClient):
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_requests=engine_args.enable_log_requests,
-            log_stats=not engine_args.disable_log_stats,
+            log_stats=True,
+            emit_stats=not engine_args.disable_log_stats,
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,

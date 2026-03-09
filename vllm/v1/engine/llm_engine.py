@@ -54,6 +54,7 @@ class LLMEngine:
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        emit_stats: bool = True,
         aggregate_engine_logging: bool = False,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
@@ -67,6 +68,7 @@ class LLMEngine:
         self.cache_config = vllm_config.cache_config
 
         self.log_stats = log_stats
+        self.emit_stats = emit_stats
 
         parallel_config = vllm_config.parallel_config
         executor_backend = parallel_config.distributed_executor_backend
@@ -118,7 +120,7 @@ class LLMEngine:
             self.logger_manager = StatLoggerManager(
                 vllm_config=vllm_config,
                 custom_stat_loggers=stat_loggers,
-                enable_default_loggers=log_stats,
+                enable_default_loggers=emit_stats,
                 aggregate_engine_logging=aggregate_engine_logging,
             )
             self.logger_manager.log_engine_initialized()
@@ -146,7 +148,8 @@ class LLMEngine:
         return cls(
             vllm_config=vllm_config,
             executor_class=Executor.get_class(vllm_config),
-            log_stats=(not disable_log_stats),
+            log_stats=True,
+            emit_stats=not disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
             multiprocess_mode=envs.VLLM_ENABLE_V1_MULTIPROCESSING,
@@ -174,7 +177,8 @@ class LLMEngine:
         return cls(
             vllm_config=vllm_config,
             executor_class=executor_class,
-            log_stats=not engine_args.disable_log_stats,
+            log_stats=True,
+            emit_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
             multiprocess_mode=enable_multiprocessing,
