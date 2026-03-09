@@ -70,6 +70,7 @@ class Request:
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
         priority: int = 0,
+        is_precompute: bool = False,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
@@ -78,6 +79,7 @@ class Request:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        self.is_precompute = is_precompute
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         # Because of LoRA, the eos token id can be different for each request.
@@ -195,6 +197,7 @@ class Request:
             lora_request=request.lora_request,
             cache_salt=request.cache_salt,
             priority=request.priority,
+            is_precompute=bool(request.priority),
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             resumable=request.resumable,

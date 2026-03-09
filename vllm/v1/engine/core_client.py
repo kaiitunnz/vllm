@@ -43,6 +43,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
@@ -843,6 +844,11 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+
+        # For backpressure scheduling
+        self._cur_scheduler_stats: SchedulerStats | None = None
+        self._stats_cvar = asyncio.Condition()
+
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -890,6 +896,11 @@ class AsyncMPClient(MPClient):
 
                     if outputs.outputs or outputs.scheduler_stats:
                         outputs_queue.put_nowait(outputs)
+
+                    if outputs.scheduler_stats:
+                        async with self._stats_cvar:
+                            self._cur_scheduler_stats = outputs.scheduler_stats
+                            self._stats_cvar.notify_all()
             except Exception as e:
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:
@@ -1041,6 +1052,25 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    async def get_scheduler_stats(self) -> SchedulerStats:
+        """Wait until the next scheduler stats are available and return them."""
+        async with self._stats_cvar:
+            await self._stats_cvar.wait_for(
+                lambda: self._cur_scheduler_stats is not None
+            )
+            assert self._cur_scheduler_stats is not None
+            stats = self._cur_scheduler_stats
+            self._cur_scheduler_stats = None
+            return stats
+
+    async def clear_scheduler_stats(self) -> None:
+        """Clear any pending scheduler stats without returning them."""
+        async with self._stats_cvar:
+            self._cur_scheduler_stats = None
+
+    async def change_kv_role_async(self, new_role: str) -> None:
+        await self.call_utility_async("change_kv_role", new_role)
 
 
 class DPAsyncMPClient(AsyncMPClient):

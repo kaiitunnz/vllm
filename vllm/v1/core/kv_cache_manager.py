@@ -203,6 +203,21 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def get_num_computed_tokens(self, request: Request) -> int:
+        """Get the number of computed (cached) tokens for the request.
+
+        Args:
+            request: The request to get the number of computed tokens.
+
+        Returns:
+            The number of computed tokens for the request.
+        """
+        log_stats = self.log_stats
+        self.log_stats = False
+        _, num_computed_tokens = self.get_computed_blocks(request)
+        self.log_stats = log_stats
+        return num_computed_tokens
+
     def allocate_slots(
         self,
         request: Request,

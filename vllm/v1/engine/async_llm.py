@@ -51,7 +51,7 @@ from vllm.v1.metrics.loggers import (
     load_stat_logger_plugin_factories,
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
-from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 logger = init_logger(__name__)
 
@@ -981,6 +981,15 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
+
+    async def get_scheduler_stats(self) -> SchedulerStats:
+        return await self.engine_core.get_scheduler_stats()
+
+    async def clear_scheduler_stats(self) -> None:
+        await self.engine_core.clear_scheduler_stats()
+
+    async def change_kv_role(self, new_role: str) -> None:
+        await self.engine_core.change_kv_role_async(new_role)
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

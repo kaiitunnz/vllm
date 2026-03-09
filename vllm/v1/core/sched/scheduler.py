@@ -59,6 +59,8 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+USE_LSPF: bool = False  # Whether to use the LSPF scheduling algorithm.
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -157,6 +159,8 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        # GPU-retained precomputed requests (KV cache retained until evicted).
+        self.precomputed: deque[Request] = deque()
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -270,6 +274,18 @@ class Scheduler(SchedulerInterface):
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 vllm_config=self.vllm_config,
             )
+
+    def change_kv_role(self, new_role: str) -> None:
+        if self.connector is not None:
+            connector = self.connector
+            if hasattr(connector, "_lmcache_engine"):
+                lmcache_engine = connector._lmcache_engine  # type: ignore
+                if hasattr(lmcache_engine, "kv_role"):
+                    lmcache_engine.kv_role = new_role  # type: ignore
+                    return
+            logger.warning("Scheduler's connector does not support changing KV role.")
+        else:
+            logger.warning("KVConnector is not initialized.")
 
     def _mamba_block_aligned_split(
         self,
@@ -473,6 +489,18 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
+                # Before giving up, try freeing precomputed requests.
+                while self.precomputed and new_blocks is None:
+                    preempted_req = self.precomputed.popleft()
+                    preempted_req.is_precompute = False
+                    self._free_request(preempted_req)
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+
+            if new_blocks is None:
                 # Cannot schedule this request.
                 break
 
@@ -531,6 +559,15 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
+            if USE_LSPF and self.waiting and token_budget > 0:
+                # Longest-shared-prefix-first (LSPF) scheduling.
+                sorted_requests = sorted(
+                    self.waiting,
+                    key=self.kv_cache_manager.get_num_computed_tokens,
+                    reverse=True,
+                )
+                self.waiting.clear()
+                self.waiting.extend(sorted_requests)
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -720,6 +757,23 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
+
+                if new_blocks is None:
+                    # Try freeing precomputed requests before giving up.
+                    while self.precomputed and new_blocks is None:
+                        preempted_req = self.precomputed.popleft()
+                        preempted_req.is_precompute = False
+                        self._free_request(preempted_req)
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_lookahead_tokens=effective_lookahead_tokens,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            delay_cache_blocks=load_kv_async,
+                            num_encoder_tokens=num_encoder_tokens,
+                        )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1717,6 +1771,10 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+        if request.is_precompute:
+            # Retain KV blocks in GPU cache for this pre-warmed request.
+            self.precomputed.append(request)
+            return None
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -1748,11 +1806,19 @@ class Scheduler(SchedulerInterface):
     ) -> bool:
         """Reset the KV prefix cache.
 
+        Frees all GPU-retained precomputed requests before resetting.
+
         If reset_running_requests is True, all the running requests will be
         preempted and moved to the waiting queue.
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        # Free all GPU-retained precomputed requests first.
+        for request in self.precomputed:
+            request.is_precompute = False
+            self._free_request(request)
+        self.precomputed.clear()
+
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
