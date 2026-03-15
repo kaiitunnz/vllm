@@ -448,6 +448,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
+            current_request_preempted = False
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -488,15 +489,37 @@ class Scheduler(SchedulerInterface):
                             req_index -= 1
                     else:
                         preempted_req = self.running.pop()
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                # Restore encoder compute budget if the preempted
+                                # request had encoder inputs scheduled in this step.
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
+                        current_request_preempted = True
                         break
 
-            if new_blocks is None:
+            if new_blocks is None and not current_request_preempted:
                 # Before giving up, try freeing precomputed requests.
+                # Skip this if the current request was itself preempted —
+                # it is no longer in self.running, its KV cache was freed,
+                # and it was moved to self.waiting by _preempt_request.
                 while self.precomputed and new_blocks is None:
                     preempted_req = self.precomputed.popleft()
                     preempted_req.is_precompute = False
